@@ -582,6 +582,97 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
     return model
 
 
+# --- Checkpointing and Loading Functions ---
+CHECKPOINT_FILENAME = f"model_checkpoint.pth"
+
+def save_checkpoint(epoch, model, optimizer, scaler, current_loss, checkpoint_dir="checkpoints"):
+    """Saves model checkpoint."""
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, CHECKPOINT_FILENAME)
+
+    # If model is wrapped in DataParallel, save the underlying module's state_dict
+    model_state_dict_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
+    print(f"Saving checkpoint to {checkpoint_path} (End of Epoch {epoch+1}, Loss: {current_loss:.4f})")
+    checkpoint = {
+        'epoch': epoch + 1,  # Save as the epoch number *completed*
+        'model_state_dict': model_state_dict_to_save,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'best_loss_checkpointed': current_loss
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved successfully.")
+
+
+def load_checkpoint(model, optimizer, scaler, device, checkpoint_dir="checkpoints"):
+    """Loads model checkpoint if it exists.
+    Returns: start_epoch (0-indexed), best_loss_checkpointed
+    """
+    checkpoint_path = os.path.join(checkpoint_dir, CHECKPOINT_FILENAME)
+    start_epoch = 0 # 0-indexed epoch to start training from
+    best_loss_checkpointed = float('inf')
+
+    if os.path.isfile(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+
+            saved_model_state_dict = checkpoint['model_state_dict']
+            
+            # Handle DataParallel differences
+            current_is_parallel = isinstance(model, nn.DataParallel)
+            
+            if current_is_parallel:
+                # If current model is DataParallel, saved keys might or might not have 'module.'
+                # If saved keys don't have 'module.', add it.
+                if not all(key.startswith('module.') for key in saved_model_state_dict.keys()):
+                    print("Saved model was not DataParallel, current is. Adding 'module.' prefix.")
+                    from collections import OrderedDict
+                    new_state_dict = OrderedDict()
+                    for k, v in saved_model_state_dict.items():
+                        name = 'module.' + k
+                        new_state_dict[name] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                    model.load_state_dict(saved_model_state_dict) # Both parallel, direct load
+            else:
+                # If current model is NOT DataParallel, saved keys might have 'module.'
+                # If saved keys have 'module.', strip it.
+                if all(key.startswith('module.') for key in saved_model_state_dict.keys()):
+                    print("Saved model was DataParallel, current is not. Stripping 'module.' prefix.")
+                    from collections import OrderedDict
+                    new_state_dict = OrderedDict()
+                    for k, v in saved_model_state_dict.items():
+                        name = k[7:] # remove `module.`
+                        new_state_dict[name] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                     model.load_state_dict(saved_model_state_dict) # Both not parallel, direct load
+
+
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint['epoch'] # This is the epoch number training should *start* from (0-indexed)
+                                              # e.g., if saved after epoch 0, checkpoint['epoch'] is 1, so start_epoch is 1.
+                                              # If saved after epoch N (0-indexed), checkpoint['epoch'] is N+1. Loop will be range(N+1, num_epochs)
+            start_epoch = 0 # Hard coded for the moment to avoid plotting errors
+            best_loss_checkpointed = checkpoint.get('best_loss_checkpointed', float('inf'))
+
+            print(f"Checkpoint loaded. Resuming training from epoch {start_epoch +1} (0-indexed: {start_epoch}).")
+            print(f"Best loss recorded in loaded checkpoint: {best_loss_checkpointed:.4f}")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}. Starting from scratch.")
+            start_epoch = 0
+            best_loss_checkpointed = float('inf')
+    else:
+        print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
+
+    return start_epoch, best_loss_checkpointed
+
+
+
 
 
 # Optimized Training Loop
@@ -790,6 +881,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-epochs", type=int, default=50)
     parser.add_argument("--job_id", type=str, default=None)
+    parser.add_argument("--load_id", type=str, default=None)
     parser.add_argument("--model-depth", type=int, default=10)
     parser.add_argument("--model_params", type=str, nargs='+', default=['Dens', 'Lum', 'radius', 'prho'], help="Model parameters to predict")
     parser.add_argument("--log-scale-params", type=str, nargs='+', default=['Dens','Lum'], help="Log scale parameters for the model")
@@ -810,6 +902,10 @@ if __name__ == "__main__":
     )
     # Create folder for plots
     os.makedirs(f"plots", exist_ok=True)
+
+    # Specify checkpointing directory
+    checkpoint_save_dir = f"checkpoints/{args.job_id}/"
+    checkpoint_load_dir = f"checkpoints/{args.load_id}"
 
     global TARGET_PARAMETERS
     TARGET_PARAMETERS = args.model_params
@@ -887,6 +983,7 @@ if __name__ == "__main__":
     test_losses = []
     loss_per_param_history = []
     num_epochs = args.num_epochs
+    checkpoint_interval = 5
 
     labels = args.model_params#, "NCH3CN", "incl", "phi"]
     
@@ -895,6 +992,10 @@ if __name__ == "__main__":
 
     # Create directory for plots
     os.makedirs(f"ResNetPlots/{args.job_id}", exist_ok=True)
+
+    # Load checkpoint if exists
+    # `best_loss_at_last_checkpoint_save` stores the loss value OF THE CHECKPOINT CURRENTLY ON DISK
+    start_epoch, best_loss_at_last_checkpoint_save = load_checkpoint(model, optimizer, scaler, device, checkpoint_load_dir)
 
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch+1}/{num_epochs}')
@@ -937,6 +1038,23 @@ if __name__ == "__main__":
             max_epochs = max_epochs,
             update_interval=5
         )
+
+        # Checkpointing logic
+        # Condition 1: Is it a checkpointing epoch?
+        if (epoch + 1) % checkpoint_interval == 0:
+            # Condition 2: Is current loss better than the loss of the checkpoint on disk?
+            if test_loss < best_loss_at_last_checkpoint_save:
+                print(f"Current test loss ({test_loss:.4f}) is better than "
+                      f"loss of saved checkpoint ({best_loss_at_last_checkpoint_save:.4f}).")
+                save_checkpoint(epoch, model, optimizer, scaler, test_loss, checkpoint_save_dir)
+                best_loss_at_last_checkpoint_save = test_loss # Update with the new best loss saved
+            else:
+                print(f"Current test loss ({test_loss:.4f}) is not better than "
+                      f"loss of saved checkpoint ({best_loss_at_last_checkpoint_save:.4f}). "
+                      f"Checkpoint not updated for epoch {epoch+1}.")
+        else:
+            if epoch < num_epochs -1 : # Avoid printing for the last epoch if it's not a checkpoint interval
+                 print(f"Epoch {epoch+1} is not a designated checkpointing interval (every {checkpoint_interval} epochs).")
                 
         #if early_stopper.early_stop:
         #    print(f"Early stopping triggered at epoch {epoch}")
