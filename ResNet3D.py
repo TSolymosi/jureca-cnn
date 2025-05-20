@@ -724,8 +724,8 @@ def test(model, test_loader, criterion, device, epoch):
     return test_loss / len(test_loader), all_preds, all_targets, loss_per_param
 
 
-def save_training_plots(train_losses, test_losses, loss_per_param_history, labels, job_id, epoch, update_interval=10):
-    if (epoch + 1) % update_interval == 0 or (epoch + 1) == len(train_losses):
+def save_training_plots(train_losses, test_losses, loss_per_param_history, labels, job_id, epoch, max_epochs, update_interval=10):
+    if (epoch + 1) % update_interval == 0 or (epoch + 1) == max_epochs:
         # Training and Validation loss
         plt.figure(figsize=(8, 5))
         plt.plot(train_losses, label='Train Loss')
@@ -789,7 +789,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--use-local-nvme", type=bool, default=False)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--num-epochs", type=int, default=200)
+    parser.add_argument("--num-epochs", type=int, default=50)
     parser.add_argument("--job_id", type=str, default=None)
     parser.add_argument("--model-depth", type=int, default=10)
     parser.add_argument("--model_params", type=str, nargs='+', default=['Dens', 'Lum', 'radius', 'prho'], help="Model parameters to predict")
@@ -814,6 +814,8 @@ if __name__ == "__main__":
 
     global TARGET_PARAMETERS
     TARGET_PARAMETERS = args.model_params
+
+    max_epochs = args.num_epochs
 
     # Train with AMP
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -933,6 +935,7 @@ if __name__ == "__main__":
             labels=labels,
             job_id=args.job_id,
             epoch=epoch,
+            max_epochs = max_epochs,
             update_interval=5
         )
                 
