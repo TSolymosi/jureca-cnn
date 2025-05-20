@@ -388,9 +388,7 @@ class Spectral2DResNet(nn.Module):
         self.in_planes = current_channels # Track input planes for each block
         
         # spatial_layers_config = [(planes_out, stride, num_blocks_in_stage), ...]
-        # Example S1-like: [(64,1,1), (128,2,1), (256,2,1)] where num_blocks_in_stage is 1 for S1's simple structure
-        # If you want deeper stages like ResNet18 (2 blocks per stage), config could be:
-        # [(64,1,2), (128,2,2), (256,2,2), (512,2,2)] # for a ResNet18-like 2D structure
+        
         
         for i, (planes_out, stride, num_blocks) in enumerate(spatial_layers_config):
             self.spatial_layers.append(
@@ -495,8 +493,7 @@ class Spectral2DResNet(nn.Module):
         return torch.cat(outputs, dim=1)
 
 
-# Global flag to control head style (for demonstration)
-S1_SpectralCNN_SpectralConv_like_head = True 
+
 
 
 def generate_model(model_depth, **kwargs):
@@ -518,6 +515,7 @@ def generate_model(model_depth, **kwargs):
     return model
 
 
+S1_SpectralCNN_SpectralConv_like_head = True
 
 def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
     """
@@ -534,6 +532,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
         'fc_hidden_dim': 512,
         'target_params_list': TARGET_PARAMETERS
     }
+    
 
     if config_name == "s1_spec_conv_like":
         # Mimics SpectralCNN_SpectralConv: 3 spatial blocks (64->64, 64->128, 128->256)
@@ -549,7 +548,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
         S1_SpectralCNN_SpectralConv_like_head = True
 
 
-    elif config_name == "s1_resnet10_2d_equivalent":
+    elif config_name == "resnet10_2d_equivalent":
         # A ResNet10-like structure, but 2D spatial, 4 stages
         spatial_config = [
             (64, 1, 1),
@@ -560,7 +559,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
         block_type = BasicBlock2D
         S1_SpectralCNN_SpectralConv_like_head = True 
 
-    elif config_name == "s1_resnet18_2d_equivalent":
+    elif config_name == "resnet18_2d_equivalent":
          # ResNet18 usually is [2,2,2,2] for 4 stages.
          spatial_config = [
              (64, 1, 2),
