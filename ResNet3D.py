@@ -414,7 +414,7 @@ class Spectral2DResNet(nn.Module):
         # Using separate heads
         self.output_heads = nn.ModuleDict()
         for param_name in target_params_list:
-            if fc_hidden_dim == 512 and n_outputs == 4 and S1_SpectralCNN_SpectralConv_like_head:
+            if fc_hidden_dim == 512 and n_outputs == 4 and simple_feature_head:
                  self.output_heads[param_name] = nn.Linear(fc_hidden_dim, 1) # Simpler head
             else:
                  self.output_heads[param_name] = nn.Sequential(
@@ -534,7 +534,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
     }
     
 
-    if config_name == "s1_spec_conv_like":
+    if config_name == "resnet10_3layers":
         # Mimics SpectralCNN_SpectralConv: 3 spatial blocks (64->64, 64->128, 128->256)
         # Each "stage" here has 1 block.
         spatial_config = [
@@ -544,8 +544,8 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
         ]
         block_type = BasicBlock2D
         # Set head style if needed for specific model
-        global S1_SpectralCNN_SpectralConv_like_head
-        S1_SpectralCNN_SpectralConv_like_head = True
+        global simple_feature_head
+        simple_feature_head = True
 
 
     elif config_name == "resnet10_2d_equivalent":
@@ -557,7 +557,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
             (512, 2, 1) # ResNet 4th stage
         ]
         block_type = BasicBlock2D
-        S1_SpectralCNN_SpectralConv_like_head = True 
+        simple_feature_head = True 
 
     elif config_name == "resnet18_2d_equivalent":
          # ResNet18 usually is [2,2,2,2] for 4 stages.
@@ -568,7 +568,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
              (512, 2, 2)
          ]
          block_type = BasicBlock2D
-         S1_SpectralCNN_SpectralConv_like_head = True
+         simple_feature_head = True
 
     else:
         raise ValueError(f"Unknown config_name: {config_name}")
@@ -931,7 +931,7 @@ if __name__ == "__main__":
     print(f"Model depth: {args.model_depth}")
     model_depth = args.model_depth
     #model = generate_model(model_depth=model_depth, n_outputs=num_outputs)
-    model = generate_2d_model(config_name="s1_spec_conv_like",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
+    model = generate_2d_model(config_name="resnet10_3layers",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
     
 
     # Trying to use multi GPUs 
