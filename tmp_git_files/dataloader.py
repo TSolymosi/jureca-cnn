@@ -10,7 +10,6 @@ import time
 import glob
 import random
 
-# Git version (test)
 
 def normalize(data, method='minmax'):
     """Normalize 3D data using specified method"""
