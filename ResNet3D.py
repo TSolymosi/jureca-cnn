@@ -931,7 +931,7 @@ if __name__ == "__main__":
     print(f"Model depth: {args.model_depth}")
     model_depth = args.model_depth
     #model = generate_model(model_depth=model_depth, n_outputs=num_outputs)
-    model = generate_2d_model(config_name="resnet10_3layers",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
+    model = generate_2d_model(config_name="resnet10_2d_equivalent",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
     
 
     # Trying to use multi GPUs 
