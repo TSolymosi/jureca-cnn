@@ -259,19 +259,19 @@ def create_dataloaders(
         all_files = [line.strip() for line in f if line.strip()]
 
     all_labels = np.array([extract_label(f) for f in all_files])
-    label_min = all_labels.min(axis=0)
-    label_max = all_labels.max(axis=0)
+    #label_min = all_labels.min(axis=0)
+    #label_max = all_labels.max(axis=0)
 
     # Train-test split at file list level
-    train_files, test_files = train_test_split(
-        all_files, test_size=test_split_ratio, random_state=random_seed
+    train_files, test_files, train_labels, test_labels = train_test_split(
+        all_files, all_labels, test_size=test_split_ratio, random_state=random_seed
     )
 
-    train_labels = np.array([extract_label(f) for f in train_files])
+    #train_labels = np.array([extract_label(f) for f in train_files])
     train_label_min = train_labels.min(axis=0)
     train_label_max = train_labels.max(axis=0)
 
-    test_labels = np.array([extract_label(f) for f in test_files])
+    #test_labels = np.array([extract_label(f) for f in test_files])
     test_label_min = test_labels.min(axis=0)
     test_label_max = test_labels.max(axis=0)
 
@@ -286,6 +286,7 @@ def create_dataloaders(
         label_min=train_label_min,
         model_params=model_params,
         log_scale_params=log_scale_params,
+        normalization_method=normalization_method,
     )
 
     test_dataset = FitsDataset(
@@ -297,6 +298,7 @@ def create_dataloaders(
         label_min=test_label_min,
         model_params=model_params,
         log_scale_params=log_scale_params,
+        normalization_method=normalization_method,
     )
 
     # Optional: apply label scaling (shared across both)

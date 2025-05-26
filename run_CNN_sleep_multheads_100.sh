@@ -4,7 +4,7 @@
 # Loading modules and activating venv inside srun's bash -c
 
 # --- Configuration - Needs to be updated before running! ---
-JOB_ID="13702381" # Replace with the actual JOB ID of the sleeping job
+JOB_ID="13712081" # Replace with the actual JOB ID of the sleeping job
 TRAINING_JOB_ID="13620964" # Replace with the actual JOB ID of the trained job to continue
 CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
@@ -14,7 +14,8 @@ ORIGINAL_FILE_LIST_PATH="/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN/File
 #ORIGINAL_FILE_LIST="${ORIGINAL_FITS_SCRATCH_DIR}/file_list.txt"
 #SCALING_PARAMS_PATH="/p/scratch/pasta/production_run/CNN_Python/scaling_params.pt" # Correct path
 SCRIPT_DIR="/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN"
-SCRIPT_NAME="ResNet3D_100.py"
+#SCRIPT_NAME="ResNet3D_100.py"
+SCRIPT_NAME="SpectralSpatialResNet.py"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
 VENV_PATH="/p/scratch/pasta/CNN/.venv/bin/activate" # Path to your venv activation script
 SAVE_DIR="${SCRIPT_DIR}/${TRAINING_JOB_ID}_model_checkpoints" # Where checkpoints are saved/loaded from
@@ -56,7 +57,7 @@ python \"${SCRIPT_PATH}\" \\
     --batch-size 32 \\
     --num-workers 16 \\
     --model-depth 34 \\
-    --normalization-method 'minmax' \\
+    --normalization-method 'zscore' \\
     --log-scale-params Dens Lum \\
     --job-id ${JOB_ID} 
 

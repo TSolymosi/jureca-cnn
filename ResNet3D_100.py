@@ -56,8 +56,20 @@ class WeightedMSELoss(nn.Module):
 
     def forward(self, y_pred, y_true):
         error = (y_pred - y_true) ** 2
+
+        # Handle 1D case (e.g. single param column)
+        if error.dim() == 1:
+            weight = self.weights[0] if self.weights.numel() == 1 else self.weights.to(y_pred.device)[0]
+            return (error * weight).mean()
+
         weighted_error = error * self.weights.to(y_pred.device)
         return weighted_error.mean()
+
+
+    #def forward(self, y_pred, y_true):
+    #    error = (y_pred - y_true) ** 2
+    #    weighted_error = error * self.weights.to(y_pred.device)
+    #    return weighted_error.mean()
     
 
 class BasicBlock(nn.Module):
@@ -367,9 +379,9 @@ if __name__ == "__main__":
     #parser.add_argument("--load-preprocessed", type=bool, default=False)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--num-epochs", type=int, default=200)
+    parser.add_argument("--num-epochs", type=int, default=50)
     parser.add_argument("--job-id", type=str, default=None)
-    parser.add_argument("--model-depth", type=int, default=18)
+    parser.add_argument("--model-depth", type=int, default=34)
     parser.add_argument("--model-params", type=str, nargs='+', default=["Dens", "Lum", "radius", "prho"])
     parser.add_argument("--log-scale-params", type=str, nargs='+', default=["Dens", "Lum"])
     parser.add_argument("--normalization-method", type=str, default="zscore")
@@ -437,11 +449,11 @@ if __name__ == "__main__":
     #else:
     #    print("Model weights file not found")
 
-    criterion = nn.MSELoss()
-    #criterion = WeightedMSELoss(weights=[1.0, 1.0, 5.0, 5.0])  # Adjust weights as needed
+    #criterion = nn.MSELoss()
+    criterion = WeightedMSELoss(weights=[1.0, 1.0, 5.0, 5.0])  # Adjust weights as needed
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
     scaler = GradScaler('cuda')
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)#, min_lr=1e-6)
 
     train_losses = []
     test_losses = []
