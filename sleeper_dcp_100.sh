@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=data_stage_sleep
-#SBATCH --output=slurm_output/sleeper_dcp_100.out
-#SBATCH --error=slurm_output/sleeper_dcp_100.err
+#SBATCH --output=slurm_output/sleeper_dcp_100_%j.out
+#SBATCH --error=slurm_output/sleeper_dcp_100_%j.err
 #SBATCH --partition=dc-hwai
 #SBATCH --account=westai0043
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=8  # Allocate enough CPUs for the eventual Python run
 #SBATCH --mem=128G         # Allocate enough memory
 #SBATCH --gres=gpu:4       # Allocate GPU
-#SBATCH --time=03:00:00    # Long enough for copy + debugging
+#SBATCH --time=24:00:00    # Long enough for copy + debugging
 
 echo "--- Loading Environment ---"
 VENV_PATH="/p/scratch/pasta/CNN/.venv/bin/activate"
@@ -25,8 +25,8 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 
 # --- Define Paths ---
-#ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data/"
 ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
+#ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
 NODE_LOCAL_DIR="/local/nvme/${SLURM_JOB_ID}_fits_data"
 # Flag file to indicate copy completion
 COPY_DONE_FLAG="${NODE_LOCAL_DIR}/.copy_done"

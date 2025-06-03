@@ -490,9 +490,6 @@ class Spectral2DResNet(nn.Module):
         return torch.cat(outputs, dim=1)
 
 
-
-
-
 def generate_model(model_depth, **kwargs):
     assert model_depth in [10, 18, 34, 50, 101, 152, 200]
     if model_depth == 10:
@@ -874,7 +871,7 @@ if __name__ == "__main__":
                 plt.grid(True, which="both", ls="--")
                 plt.legend()
                 plt.tight_layout()
-                plt.savefig(f"ResNetPlots/{files_per_job}_files/{args.job_id}/Epochs/epoch_{epoch+1}_{param}_100.png")
+                plt.savefig(f"ResNetPlots/{files_per_job}_files/{args.job_id}/Epochs/epoch_{epoch+1}_{param}_{files_per_job}.png")
                 plt.close()
 
 
@@ -900,8 +897,8 @@ if __name__ == "__main__":
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f"ResNetPlots/{files_per_job}_files/{args.job_id}/Train_vs_Validation_100.png")
-    print("Saved: Train_vs_Validation_100.png")
+    plt.savefig(f"ResNetPlots/{files_per_job}_files/{args.job_id}/Train_vs_Validation_{files_per_job}.png")
+    print(f"Saved: Train_vs_Validation_{files_per_job}.png")
 
     #mae_values = np.array(mae_values)  # shape: (epochs, n_outputs)
     #n_outputs = mae_values.shape[1]
@@ -928,5 +925,5 @@ if __name__ == "__main__":
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"ResNetPlots/{files_per_job}_files/{args.job_id}/{param}_loss_100.png")
-        print(f"Saved: {param}_loss_100.png")
+        plt.savefig(f"ResNetPlots/{files_per_job}_files/{args.job_id}/{param}_loss_{files_per_job}.png")
+        print(f"Saved: {param}_loss_{files_per_job}.png")
