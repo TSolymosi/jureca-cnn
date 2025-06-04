@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=data_stage_sleep
-#SBATCH --output=slurm_output/sleeper_dcp_%j.out
-#SBATCH --error=slurm_output/sleeper_dcp_%j.err
+#SBATCH --output=slurm_output/sleeper_dcp.out
+#SBATCH --error=slurm_output/sleeper_dcp.err
 #SBATCH --partition=dc-hwai
 #SBATCH --account=westai0043
 #SBATCH --ntasks=8

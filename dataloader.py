@@ -98,7 +98,7 @@ class FitsDataset(data.Dataset):
                 self.fits_files = [
                     os.path.join(root, f)
                     for root, _, files in os.walk(self.fits_dir)
-                    for f in files if f.endswith("arcsec.fits") and self._is_valid_fits(os.path.join(root, f))
+                    for f in files if f.endswith("arcsec.fits")
                 ]
 
             if len(self.fits_files) == 0:
@@ -114,13 +114,6 @@ class FitsDataset(data.Dataset):
             #np.save("Parameters/label_min.npy", self.label_min)
             #np.save("Parameters/label_max.npy", self.label_max)
 
-    def _is_valid_fits(self, file_path):
-        #try:
-        #    with fits.open(file_path, memmap=True) as hdul:
-        #        return hdul[0].data is not None
-        #except Exception:
-        #    return False
-        return True
         
     def set_scaling_params(self, means, stds):
         self.scaler_means = means

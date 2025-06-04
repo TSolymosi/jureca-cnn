@@ -4,20 +4,20 @@
 # Loading modules and activating venv inside srun's bash -c
 
 # --- Configuration - Needs to be updated before running! ---
-JOB_ID="13704709" # Replace with the actual JOB ID of the sleeping job
-TRAINING_JOB_ID="" # Replace with the actual JOB ID of the trained job to continue
+JOB_ID="13743011" # Replace with the actual JOB ID of the sleeping job
+TRAINING_JOB_ID="13743011" # Replace with the actual JOB ID of the trained job to continue
 CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
 # ---Parameters to train---
-MODEL_PARAMS="Dens Lum radius prho" # Parameters to train on
-LOG_SCALE_PARAMS="Dens Lum" # Parameters to log scale during training
+MODEL_PARAMS="Dens Lum radius prho NCH3CN incl phi" # Parameters to train on
+LOG_SCALE_PARAMS="Dens Lum NCH3CN" # Parameters to log scale during training
 
 # --- Define Paths ---
 NODE_LOCAL_DIR="/local/nvme/${JOB_ID}_fits_data"
 ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data"
 #ORIGINAL_FILE_LIST="${ORIGINAL_FITS_SCRATCH_DIR}/file_list.txt"
 #SCALING_PARAMS_PATH="/p/scratch/pasta/production_run/CNN_Python/scaling_params.pt" # Correct path
-SCRIPT_DIR="/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN_TS"
+SCRIPT_DIR="/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN"
 SCRIPT_NAME="ResNet3D.py"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
 VENV_PATH="/p/scratch/pasta/CNN/.cnn_venv/bin/activate" # Path to your venv activation script
@@ -69,7 +69,8 @@ python \"${SCRIPT_PATH}\" \\
     --num-epochs 40 \\
     --model_params ${MODEL_PARAMS} \\
     --log-scale-params ${LOG_SCALE_PARAMS} \\
-    --job_id ${JOB_ID} 
+    --job_id ${JOB_ID} \\
+    --load_id ${TRAINING_JOB_ID}
 echo 'Python script finished.'
 " | tee "${LOG_FILE}" # Capture output to log file
 #" > "slurm_output/cnn_run.log" 2>&1 # End of bash -c command string

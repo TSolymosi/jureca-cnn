@@ -682,9 +682,12 @@ def train(model, train_loader, optimizer, criterion, device, scaler):
 
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
-
-        # Inject noise into the labels
-        per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3], device=target.device)
+        
+        if target.shape[1] == 7:
+            per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3, 0.1, 0, 0], device=target.device)
+        else:
+            # Inject noise into the labels
+            per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3], device=target.device)
         # Check if per_target_std matches labels shape
         if per_target_std.shape[0] != target.shape[1]:
             raise ValueError(f"Shape mismatch! per_target_std: {per_target_std.shape}, Labels: {target.shape}")
