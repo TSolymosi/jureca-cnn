@@ -414,14 +414,13 @@ class Spectral2DResNet(nn.Module):
         # Using separate heads
         self.output_heads = nn.ModuleDict()
         for param_name in target_params_list:
-            if fc_hidden_dim == 512 and n_outputs == 4 and simple_feature_head:
-                 self.output_heads[param_name] = nn.Linear(fc_hidden_dim, 1) # Simpler head
-            else:
-                 self.output_heads[param_name] = nn.Sequential(
-                     nn.Linear(fc_hidden_dim, fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32 ), # Intermediate layer
-                     nn.ReLU(),
-                     nn.Linear(fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32, 1)
-                 )
+            output_dim = 2 if param_name in ("incl", "phi") else 1
+            self.output_heads[param_name] = nn.Sequential(
+                nn.Linear(fc_hidden_dim, fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32),
+                nn.ReLU(),
+                nn.Linear(fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32, output_dim)
+            )
+
 
 
         # Initialize weights
@@ -683,8 +682,10 @@ def train(model, train_loader, optimizer, criterion, device, scaler):
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         
-        if target.shape[1] == 7:
-            per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3, 0.1, 0, 0], device=target.device)
+        #print(f"incl and phi: {target[:, 5:8].mean(dim=0)}") # Debugging incl and phi
+
+        if target.shape[1] == 9:
+            per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3, 0.1, 0, 0, 0, 0], device=target.device)
         else:
             # Inject noise into the labels
             per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3], device=target.device)
@@ -714,11 +715,9 @@ def train(model, train_loader, optimizer, criterion, device, scaler):
 def test(model, test_loader, criterion, device, epoch):
     model.eval()
     test_loss = 0.0
-    # Store all predictions and targets
     all_preds = []
     all_targets = []
 
-    # Track loss per parameter
     loss_per_param = {param: [] for param in args.model_params}
 
     with torch.no_grad():
@@ -728,93 +727,79 @@ def test(model, test_loader, criterion, device, epoch):
                 output = model(data)
                 loss = criterion(output, target)
 
-                # Compute loss for each parameter
+                # Per-parameter loss (still raw sin/cos)
                 for i, param in enumerate(args.model_params):
-                    param_loss = criterion(output[:, i], target[:, i])
-                    loss_per_param[param].append(param_loss.item())
+                    if param in ("incl", "phi"):
+                        loss_per_param[param].append(0)  # skip — use angular MAE later
+                    else:
+                        param_idx = args.model_params.index(param)
+                        loss_per_param[param].append(criterion(output[:, param_idx], target[:, param_idx]).item())
 
                 test_loss += loss.item()
             all_preds.append(output.cpu())
             all_targets.append(target.cpu())
 
-    all_preds = torch.cat(all_preds).numpy()
-    all_targets = torch.cat(all_targets).numpy()
+    all_preds = torch.cat(all_preds)
+    all_targets = torch.cat(all_targets)
 
     avg_test_loss = test_loss / len(test_loader)
     print(f"\nTest Loss: {avg_test_loss:.4f}")
     print("Loss per parameter:")
     for param, losses in loss_per_param.items():
-        avg_loss = np.mean(losses)
-        print(f"  {param}: {avg_loss:.4f}")
+        if isinstance(losses, list) and losses and losses[0] != 0:
+            print(f"  {param}: {np.mean(losses):.4f}")
 
-    # Convert back to original scale for analysis
-    outputs_original = train_loader.dataset.dataset.inverse_transform_labels(all_preds)
-    targets_original = train_loader.dataset.dataset.inverse_transform_labels(all_targets)
+    # Decode predictions and targets
+    decoded_preds = decode_model_output(all_preds, args.model_params, test_loader.dataset)
+    decoded_targets = decode_model_output(all_targets, args.model_params, test_loader.dataset)
 
-    # Compute MAE
-    #mae = mean_absolute_error(all_targets, all_preds)
-    mae = torch.mean(torch.abs(outputs_original - targets_original), dim=0).numpy()  # shape: (n_outputs,)
-    print(f"Mean Absolute Error (MAE) original scale: {mae}")
+
+    # Compute angular MAE manually
+    if "incl" in args.model_params:
+        incl_idx = args.model_params.index("incl")
+        incl_error = np.abs((decoded_preds[:, incl_idx] - decoded_targets[:, incl_idx] + 180) % 360 - 180)
+        print(f"  incl MAE: {incl_error.mean():.2f}°")
+
+    if "phi" in args.model_params:
+        phi_idx = args.model_params.index("phi")
+        phi_error = np.abs((decoded_preds[:, phi_idx] - decoded_targets[:, phi_idx] + 180) % 360 - 180)
+        print(f"  phi  MAE: {phi_error.mean():.2f}°")
 
     print("Generating predicted vs. true plots...")
-
     PNG_DIR = f"./Epoch_Plots/{args.job_id}/"
     os.makedirs(PNG_DIR, exist_ok=True)
 
-    # Convert tensors to numpy arrays
-    all_outputs_original_np = outputs_original.numpy()
-    all_labels_original_np = targets_original.numpy()
+    for i, param in enumerate(args.model_params):
+        true_vals = decoded_targets[:, i]
+        pred_vals = decoded_preds[:, i]
 
-    for i, current_param_name in enumerate(args.model_params):
-        true_vals = all_labels_original_np[:, i]
-        pred_vals = all_outputs_original_np[:, i]
-
-        plt.figure(figsize=(7, 7))  # Square aspect ratio
-
-        # Log-log plot for selected parameters
-        if current_param_name in args.log_scale_params:
+        plt.figure(figsize=(7, 7))
+        if param in args.log_scale_params:
             plt.xscale('log')
             plt.yscale('log')
-            plt.title(f"Epoch {epoch+1} - {current_param_name} (Log-Log Scale)")
-
-            # Filter valid data
+            plt.title(f"Epoch {epoch+1} - {param} (Log-Log Scale)")
             mask = (true_vals > 0) & (pred_vals > 0)
-
             if np.any(mask):
                 plt.scatter(true_vals[mask], pred_vals[mask], alpha=0.3, s=10)
                 min_val = min(true_vals[mask].min(), pred_vals[mask].min())
                 max_val = max(true_vals[mask].max(), pred_vals[mask].max())
-                plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='y = x')
-            else:
-                print(f"Warning: No positive data for log-log plot of {current_param_name}")
-                plt.text(0.5, 0.5, 'No valid data', transform=plt.gca().transAxes,
-                        ha='center', va='center')
-                plt.xlim(1e-9, 1)
-                plt.ylim(1e-9, 1)
-
+                plt.plot([min_val, max_val], [min_val, max_val], 'r--')
         else:
-            # Linear plot
-            plt.title(f"Epoch {epoch+1} - {current_param_name} (Linear Scale)")
+            plt.title(f"Epoch {epoch+1} - {param} (Linear Scale)")
             plt.scatter(true_vals, pred_vals, alpha=0.3, s=10)
             min_val = min(true_vals.min(), pred_vals.min())
             max_val = max(true_vals.max(), pred_vals.max())
-            plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='y = x')
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--')
 
-        plt.xlabel(f"True {current_param_name}")
-        plt.ylabel(f"Predicted {current_param_name}")
+        plt.xlabel(f"True {param}")
+        plt.ylabel(f"Predicted {param}")
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
         plt.tight_layout()
-
-        # Save
-        plot_filename = os.path.join(PNG_DIR, f"E{epoch+1}_Test_{current_param_name}.png")
-        plt.savefig(plot_filename, dpi=150)
+        plt.savefig(os.path.join(PNG_DIR, f"E{epoch+1}_Test_{param}.png"), dpi=150)
         plt.close()
 
-    
+    return avg_test_loss, all_preds, all_targets, loss_per_param
 
-    
-
-    return test_loss / len(test_loader), all_preds, all_targets, loss_per_param
 
 
 def save_training_plots(train_losses, test_losses, loss_per_param_history, labels, job_id, epoch, max_epochs, update_interval=10):
@@ -847,6 +832,57 @@ def save_training_plots(train_losses, test_losses, loss_per_param_history, label
         plt.savefig(f"ResNetPlots/{job_id}/val_loss_per_param_E{epoch+1}.png")
         plt.close()
         print(f"Saved per-parameter loss plot for epoch {epoch+1}")
+
+# if necessary a function to decode the angles from the tensor
+def decode_model_output(output_tensor, model_params, dataset):
+    """
+    Converts model outputs (standardized + sin/cos encoded) to physical units.
+    Returns: np.ndarray of shape (N, len(model_params))
+    """
+    # Step 1: Get clean CPU tensor
+    output_tensor_cpu = output_tensor.detach().cpu()
+
+    # Step 2: Make a clean NumPy copy for angle decoding BEFORE inverse transform
+    output_np_raw = output_tensor_cpu.numpy().copy()
+
+    # Step 3: Apply inverse transform ONLY to scalar components
+    full_decoded = train_loader.dataset.dataset.inverse_transform_labels(output_tensor_cpu).numpy()
+
+    # Step 4: Decode angles from raw sin/cos (pre-scaled)
+    i = 0
+    drop_indices = []  # second slot of each angle (cos)
+    for param in model_params:
+        if param in ("incl", "phi"):
+            sin_val = output_np_raw[:, i]
+            cos_val = output_np_raw[:, i + 1]
+
+            # Normalize onto unit circle
+            norm = np.sqrt(sin_val**2 + cos_val**2) + 1e-8
+            sin_val = sin_val / norm
+            cos_val = cos_val / norm
+
+            # Decode
+            angle_rad = np.arctan2(sin_val, cos_val)
+            angle_deg = np.degrees(angle_rad)
+
+            if param == "incl":
+                angle_deg = np.abs(angle_deg)
+            elif param == "phi":
+                angle_deg = angle_deg % 360
+
+            #print(f"Decoding {param}: sin={sin_val.mean():.3f}, cos={cos_val.mean():.3f} -> angle={angle_deg.mean():.3f}°")
+
+            # Overwrite sin slot with angle
+            full_decoded[:, i] = angle_deg
+            drop_indices.append(i + 1)  # Drop cos slot
+            i += 2
+        else:
+            i += 1
+
+    # Step 5: Drop cos slots
+    final_decoded = np.delete(full_decoded, drop_indices, axis=1)
+    return final_decoded
+
 
 
 
@@ -922,11 +958,14 @@ if __name__ == "__main__":
     if device.type == 'cuda':
         print(f"GPU name: {torch.cuda.get_device_name(device)}")
 
-    # Debugging: Check input shape
-    #sample_image, _ = next(iter(train_loader))
-    #print(f"DEBUG: input shape = {sample_image.shape}") 
-    #num_outputs = len(next(iter(train_loader))[1][0])
-    num_outputs = len(TARGET_PARAMETERS)
+    # Number of outputs based on model parameters (if incl and phi are included + 2 angles)
+    num_outputs = 0
+    for param in TARGET_PARAMETERS:
+        if param in ("incl", "phi"):
+            num_outputs += 2  # sin and cos
+        else:
+            num_outputs += 1
+    print(f"Number of outputs: {num_outputs}")
 
     # Print model information
     print(f"Model parameters: {TARGET_PARAMETERS}")

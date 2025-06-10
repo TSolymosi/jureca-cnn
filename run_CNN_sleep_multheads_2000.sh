@@ -4,8 +4,8 @@
 # Loading modules and activating venv inside srun's bash -c
 
 # --- Configuration - Needs to be updated before running! ---
-JOB_ID="13743027" # Replace with the actual JOB ID of the sleeping job
-TRAINING_JOB_ID="" # Replace with the actual JOB ID of the trained job to continue
+JOB_ID="13762752" # Replace with the actual JOB ID of the sleeping job
+TRAINING_JOB_ID=" " # Replace with the actual JOB ID of the trained job to continue
 CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
 # ---Parameters to train---
@@ -54,18 +54,19 @@ echo 'Activating venv...'
 source \"${VENV_PATH}\" || { echo 'ERROR: Failed to activate venv inside srun'; exit 1; }
 echo 'Venv activated.'
 echo 'Running python: $(which python)' # Verify python path
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python \"${SCRIPT_PATH}\" \\
+python \"${SCRIPT_PATH}\" \\
     --data-dir \"${NODE_LOCAL_DIR}\" \\
     --wavelength-stride 1 \\
     --load-preprocessed False \\
     --use-local-nvme True \\
     --batch-size 64 \\
-    --num-workers 16 \\
+    --num-workers 8 \\
     --model-depth 18  \\
     --num-epochs 20 \\
     --model_params ${MODEL_PARAMS} \\
     --log-scale-params ${LOG_SCALE_PARAMS} \\
     --job_id ${JOB_ID} 
+    
 echo 'Python script finished.'
 " | tee slurm_output/cnn_run_2000.log
 #" > "slurm_output/cnn_run.log" 2>&1 # End of bash -c command string

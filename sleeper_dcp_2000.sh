@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8  # Allocate enough CPUs for the eventual Python run
 #SBATCH --mem=128G         # Allocate enough memory
 #SBATCH --gres=gpu:4       # Allocate GPU
-#SBATCH --time=24:00:00    # Long enough for copy + debugging
+#SBATCH --time=04:00:00    # Long enough for copy + debugging
 
 echo "--- Loading Environment ---"
 VENV_PATH="/p/scratch/pasta/CNN/.venv/bin/activate"

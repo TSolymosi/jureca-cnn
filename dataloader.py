@@ -131,7 +131,22 @@ class FitsDataset(data.Dataset):
         pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
         matches = re.findall(pattern, filename)
         label_dict = {k.lstrip('_'): float(v) for k, v in matches}
-        return [label_dict.get(key, 0.0) for key in self.model_params]
+        if "incl" in self.model_params and "phi" in self.model_params:
+            incl_rad = np.radians(label_dict.get("incl", 0.0))
+            phi_rad = np.radians(label_dict.get("phi", 0.0))
+            trig_map = {
+                "incl": [np.sin(incl_rad), np.cos(incl_rad)],
+                "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
+            }
+            label = []
+            for param in self.model_params:
+                if param in trig_map:
+                    label.extend(trig_map[param])  # adds 2 values
+                else:
+                    label.append(label_dict.get(param, 0.0))
+            return label
+        else:
+            return [label_dict.get(key, 0.0) for key in self.model_params]
     
     def inverse_transform_labels(self, scaled_labels):
         """
@@ -174,47 +189,64 @@ class FitsDataset(data.Dataset):
         return len(self.data_files if self.load_preprocessed else self.fits_files)
 
     def __getitem__(self, idx):
-        try:
-            if self.load_preprocessed:
-                data = np.load(self.data_files[idx])
-                label = self.labels[idx]
+        # ------------------ Load Data ------------------
+        if self.load_preprocessed:
+            data = np.load(self.data_files[idx])
+            raw_label = self.labels[idx]
+        else:
+            fits_path = self.fits_files[idx]
+            with fits.open(fits_path, memmap=True) as hdul:
+                data = hdul[0].data
+            if data is None:
+                raise ValueError(f"Data is None in FITS file: {fits_path}")
+            if self.wavelength_stride > 1:
+                data = data[::self.wavelength_stride]
+
+            # Normalize data
+            # data = normalize(data, method="zscore")
+            raw_label = self.labels[idx]
+
+        # ------------------ Process Labels ------------------
+        processed_label = []
+        i = 0
+        for param in self.model_params:
+            if param in ("incl", "phi"):
+                # Already in sin/cos from extract_label
+                processed_label.append(raw_label[i])
+                processed_label.append(raw_label[i+1])
+                i += 2
             else:
-                fits_path = self.fits_files[idx]
-                with fits.open(fits_path, memmap=True) as hdul:
-                    data = hdul[0].data
-                if data is None:
-                    raise ValueError(f"Data is None in FITS file: {fits_path}")
-                if self.wavelength_stride > 1:
-                    # Downsample data
-                    data = data[::self.wavelength_stride]
-                    
-                # Normalize data
-                #data = normalize(data, method="zscore")
-                label = self.labels[idx]
+                val = raw_label[i]
+                if param in self.log_scale_params:
+                    val = np.log10(max(val, 1e-9))
+                processed_label.append(val)
+                i += 1
 
-            # Normalize label
-            #label = (np.array(label) - self.label_min) / (self.label_max - self.label_min + 1e-8)
-            label_tensor = torch.tensor(label, dtype=torch.float32)
+        label_tensor = torch.tensor(processed_label, dtype=torch.float32)
 
-            # Log scale certain parameters
-            for i in self.param_indices_to_log:
-                label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-9))
+        # Standardize if applicable
+        if self.scaler_means is not None and self.scaler_stds is not None:
+            label_tensor = label_tensor.clone()
+            j = 0  # index into scaler_means/stds
+            i = 0  # index into label_tensor
+            while i < len(label_tensor):
+                param = self.model_params[j]
+                if param in ("incl", "phi"):
+                    i += 2  # skip sin and cos
+                else:
+                    label_tensor[i] = (label_tensor[i] - self.scaler_means[j]) / self.scaler_stds[j]
+                    i += 1
+                j += 1
 
-            # Standardize using means and stds
-            if self.scaler_means is not None and self.scaler_stds is not None:
-                label_tensor = (label_tensor - self.scaler_means) / self.scaler_stds
-            else:
-                print("[WARNING] No scaling parameters provided. Using raw labels.")
+        else:
+            print("[WARNING] No scaling parameters provided. Using raw labels.")
 
-            
+        # ------------------ Convert Data ------------------
+        data = torch.tensor(data.astype(np.float32, copy=False), dtype=torch.float32).unsqueeze(0)
 
 
-            # Return as tensors
-            data = torch.tensor(data.astype(np.float32, copy=False), dtype=torch.float32).unsqueeze(0)
-        except Exception as e:
-            print(f"[ERROR] Failed on index {idx}, file: {self.file_list[idx]}")
-            raise e
         return data, label_tensor
+
     
 def calculate_label_scaling(dataset, indices):
     labels = []
@@ -232,7 +264,16 @@ def calculate_label_scaling(dataset, indices):
     stds[stds == 0] = 1.0
     return means, stds
 
-
+def get_scalar_label_tensor(label, model_params, log_scale_params):
+    scalar_values = []
+    for i, param in enumerate(model_params):
+        if param in ("incl", "phi"):
+            continue
+        val = label[i]
+        if param in log_scale_params:
+            val = np.log10(max(val, 1e-9))
+        scalar_values.append(val)
+    return torch.tensor(scalar_values, dtype=torch.float32)
 
 """
 # Runtime config
@@ -340,8 +381,10 @@ def create_dataloaders(
 
         # Set scaling inside the dataset
         dataset.set_scaling_params(means, stds)
+        print("Parameter means:", means, "stds:", stds)
         # Print scaling parameters with param name
         print("Scaling parameters (means and stds):")
+        
         for i, param in enumerate(dataset.model_params):
             print(f"{param}: mean = {means[i]:.4f}, std = {stds[i]:.4f}")
 
