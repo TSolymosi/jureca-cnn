@@ -14,6 +14,8 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
+import pandas as pd
+
 # Override the default print function to flush the output immediately
 import functools
 print = functools.partial(print, flush=True)
@@ -205,11 +207,11 @@ class Bottleneck2D(nn.Module):
         out = self.bn1(out)
         out = self.relu(out)
 
-        out = self.conv2(x)
+        out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
 
-        out = self.conv3(x)
+        out = self.conv3(out)
         out = self.bn3(out)
 
         if self.downsample is not None:
@@ -547,7 +549,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
         simple_feature_head = True
 
 
-    elif config_name == "resnet10_2d_equivalent":
+    elif config_name == "resnet10_2d":
         # A ResNet10-like structure, but 2D spatial, 4 stages
         spatial_config = [
             (64, 1, 1),
@@ -558,7 +560,7 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
         block_type = BasicBlock2D
         simple_feature_head = True 
 
-    elif config_name == "resnet18_2d_equivalent":
+    elif config_name == "resnet18_2d":
          # ResNet18 usually is [2,2,2,2] for 4 stages.
          spatial_config = [
              (64, 1, 2),
@@ -568,6 +570,36 @@ def generate_2d_model(config_name="s1_spec_conv_like", **kwargs):
          ]
          block_type = BasicBlock2D
          simple_feature_head = True
+
+    elif config_name == "resnet34_2d":
+        spatial_config = [
+            (64, 1, 3),
+            (128, 2, 4),
+            (256, 2, 6),
+            (512, 2, 3)
+        ]
+        block_type = BasicBlock2D
+        simple_feature_head = True
+
+    elif config_name == "resnet50_2d":
+        spatial_config = [
+            (64, 1, 3),
+            (128, 2, 4),
+            (256, 2, 6),
+            (512, 2, 3)
+        ]
+        block_type = Bottleneck2D
+        simple_feature_head = True
+
+    elif config_name == "resnet101_2d":
+        spatial_config = [
+            (64, 1, 3),
+            (128, 2, 4),
+            (256, 2, 23),
+            (512, 2, 3)
+        ]
+        block_type = BasicBlock2D
+        simple_feature_head = True
 
     else:
         raise ValueError(f"Unknown config_name: {config_name}")
@@ -656,7 +688,7 @@ def load_checkpoint(model, optimizer, scaler, device, checkpoint_dir="checkpoint
             start_epoch = checkpoint['epoch'] # This is the epoch number training should *start* from (0-indexed)
                                               # e.g., if saved after epoch 0, checkpoint['epoch'] is 1, so start_epoch is 1.
                                               # If saved after epoch N (0-indexed), checkpoint['epoch'] is N+1. Loop will be range(N+1, num_epochs)
-            start_epoch = 0 # Hard coded for the moment to avoid plotting errors
+            #start_epoch = 0 # Hard coded for the moment to avoid plotting errors
             best_loss_checkpointed = checkpoint.get('best_loss_checkpointed', float('inf'))
 
             print(f"Checkpoint loaded. Resuming training from epoch {start_epoch +1} (0-indexed: {start_epoch}).")
@@ -682,23 +714,35 @@ def train(model, train_loader, optimizer, criterion, device, scaler):
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         
-        #print(f"incl and phi: {target[:, 5:8].mean(dim=0)}") # Debugging incl and phi
+        noisy_labels = False
+        #print("Training without noisy labels.")
+        if noisy_labels:
+            # Define noise std for each scalar parameter (same order as MODEL_PARAMS)
+            per_param_std = {
+                "D": 0.5, "L": 0.5, "ro": 0.2, "rr": 0.2, "p": 0.2,
+                "Tlow": 0.1, "NCH3CN": 0.1,
+                "incl": 0.0, "phi": 0.0  # If ever added back
+            }
 
-        if target.shape[1] == 9:
-            per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3, 0.1, 0, 0, 0, 0], device=target.device)
+            # Build per_target_std dynamically to match args.model_params
+            per_target_std_vals = [per_param_std.get(param, 0.0) for param in args.model_params]
+            per_target_std = torch.tensor(per_target_std_vals, device=target.device)
+
+            # Check if per_target_std matches labels shape
+            if per_target_std.shape[0] != target.shape[1]:
+                raise ValueError(f"Shape mismatch! per_target_std: {per_target_std.shape}, Labels: {target.shape}")
+            noise = torch.randn_like(target) * per_target_std
+            labels_noisy = target + noise
+
+            optimizer.zero_grad()
+            with autocast(device_type='cuda'):
+                output = model(data)
+                loss = criterion(output, labels_noisy)
         else:
-            # Inject noise into the labels
-            per_target_std = torch.tensor([0.5, 0.5, 0.2, 0.3], device=target.device)
-        # Check if per_target_std matches labels shape
-        if per_target_std.shape[0] != target.shape[1]:
-            raise ValueError(f"Shape mismatch! per_target_std: {per_target_std.shape}, Labels: {target.shape}")
-        noise = torch.randn_like(target) * per_target_std
-        labels_noisy = target + noise
-
-        optimizer.zero_grad()
-        with autocast(device_type='cuda'):
-            output = model(data)
-            loss = criterion(output, labels_noisy)
+            optimizer.zero_grad()
+            with autocast(device_type='cuda'):
+                output = model(data)
+                loss = criterion(output, target)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -706,9 +750,6 @@ def train(model, train_loader, optimizer, criterion, device, scaler):
 
         running_loss += loss.item()
     
-    #torch.save(model.state_dict(), "model_weights.pth")
-
-
     return running_loss / len(train_loader)
 
 
@@ -870,8 +911,6 @@ def decode_model_output(output_tensor, model_params, dataset):
             elif param == "phi":
                 angle_deg = angle_deg % 360
 
-            #print(f"Decoding {param}: sin={sin_val.mean():.3f}, cos={cos_val.mean():.3f} -> angle={angle_deg.mean():.3f}°")
-
             # Overwrite sin slot with angle
             full_decoded[:, i] = angle_deg
             drop_indices.append(i + 1)  # Drop cos slot
@@ -912,7 +951,6 @@ if __name__ == "__main__":
     parser.add_argument("--original-file-list", type=str, default=None)
     parser.add_argument("--scaling-params-path", type=str, default=None)
     parser.add_argument("--wavelength-stride", type=int, default=1)
-    #parser.add_argument("--load-preprocessed", type=bool, default=False)
     parser.add_argument('--load-preprocessed', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument("--preprocessed-dir", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -922,8 +960,10 @@ if __name__ == "__main__":
     parser.add_argument("--job_id", type=str, default=None)
     parser.add_argument("--load_id", type=str, default=None)
     parser.add_argument("--model-depth", type=int, default=10)
-    parser.add_argument("--model_params", type=str, nargs='+', default=['Dens', 'Lum', 'radius', 'prho'], help="Model parameters to predict")
-    parser.add_argument("--log-scale-params", type=str, nargs='+', default=['Dens','Lum'], help="Log scale parameters for the model")
+    parser.add_argument("--model_params", type=str, nargs='+', default=['Dens', 'Lum', 'radius', 'prho', 'NCH3CN', 'incl', 'phi'], help="Model parameters to predict")
+    parser.add_argument("--log-scale-params", type=str, nargs='+', default=['Dens','Lum', 'NCH3CN'], help="Log scale parameters for the model")
+    parser.add_argument("--csv-percentage", type=float, default=0.1, help="Percentage of data to use for the CSV file")
+    #parser.add_argument("checkpoint_dir", type=str, default="checkpoints", help="Directory to save/load checkpoints")
     args = parser.parse_args()
     
     train_loader, test_loader, dataset = create_dataloaders(
@@ -938,6 +978,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         model_params=args.model_params,
         log_scale_params = args.log_scale_params,
+        job_id=args.job_id,
     )
     # Create folder for plots
     os.makedirs(f"plots", exist_ok=True)
@@ -973,7 +1014,7 @@ if __name__ == "__main__":
     print(f"Model depth: {args.model_depth}")
     model_depth = args.model_depth
     #model = generate_model(model_depth=model_depth, n_outputs=num_outputs)
-    model = generate_2d_model(config_name="resnet10_2d_equivalent",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
+    model = generate_2d_model(config_name=f"resnet{model_depth}_2d",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
     
 
     # Trying to use multi GPUs 
@@ -984,32 +1025,11 @@ if __name__ == "__main__":
 
     model = model.to(device)
 
-    #from torchviz import make_dot
-    #model_graph = make_dot(model(sample_image.to(device)[:1]), params=dict(model.named_parameters()))
-    #model_graph.render("plots/model_graph", format="png")
-    #print("Saved model graph to plots/model_graph.png")
-
-    #from torchsummary import summary
-    # Show model summary
-    #summary(model, input_size=(1, 2000, 100, 100), device=str(device))
-
-    #weights_path = f"model_weights.pth"
-    #if os.path.exists(weights_path):
-    #    model.load_state_dict(torch.load(weights_path))
-    #    print("Model weights loaded.")
-    #else:
-    #    print("Model weights file not found")
-
-    #criterion = nn.L1Loss()
-    #criterion = WeightedMSELoss(weights=[1.0, 1.0, 5.0, 5.0])  # Adjust weights as needed
-    #criterion = nn.MSELoss(reduction='mean')
     criterion = nn.HuberLoss(delta=0.1, reduction='mean')
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0)
     scaler = GradScaler('cuda')
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=1e-6)
-    #scheduler = optim.lr_scheduler.CyclicLR(optimizer, base_lr=1e-6, max_lr=1e-4)
-    #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1) # Example: Decrease LR every 10 epochs
-
+    scheduler = None
+    #scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=1e-6)
 
     # Print criterion, optimizer, scaler and scheduler information
     print(f"Criterion: {criterion}")
@@ -1038,15 +1058,18 @@ if __name__ == "__main__":
     # Load checkpoint if exists
     # `best_loss_at_last_checkpoint_save` stores the loss value OF THE CHECKPOINT CURRENTLY ON DISK
     start_epoch, best_loss_at_last_checkpoint_save = load_checkpoint(model, optimizer, scaler, device, checkpoint_load_dir)
+    num_epochs += start_epoch  # Adjust total epochs to account for loaded checkpoint
 
-    for epoch in range(num_epochs):
+
+    for epoch in range(start_epoch, num_epochs):
+        print("Epoch range: ", range(start_epoch, num_epochs))
         print(f'\nEpoch {epoch+1}/{num_epochs}')
         start_time = time.time()
 
         train_loss = train(model, train_loader, optimizer, criterion, device, scaler)
         test_loss, preds, targets, loss_per_param = test(model, test_loader, criterion, device, epoch)
         # Scheduler step based on validation loss in case of ReduceLROnPlateau
-        scheduler.step(test_loss) if isinstance(scheduler, ReduceLROnPlateau) else  scheduler.step()
+        #scheduler.step(test_loss) if isinstance(scheduler, ReduceLROnPlateau) else  scheduler.step()
         
         #early_stopper.step(test_loss)
         end_time = time.time()
@@ -1055,15 +1078,6 @@ if __name__ == "__main__":
         print(f"Train Loss: {train_loss:.4f} | Validation Loss: {test_loss:.4f}")
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}: LR = {current_lr:.2e}")
-
-        # Denormalize predictions and targets
-        #label_min = np.load("Parameters/label_min.npy")
-        #label_max = np.load("Parameters/label_max.npy")
-        #label_min = np.load("/p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data/labels_100/label_min.npy")
-        #label_max = np.load("/p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data/labels_100/label_max.npy")
-        
-        #denorm_preds = preds * (label_max - label_min) + label_min
-        #denorm_targets = targets * (label_max - label_min) + label_min
         
         train_losses.append(train_loss)
         test_losses.append(test_loss)
@@ -1080,6 +1094,219 @@ if __name__ == "__main__":
             max_epochs = max_epochs,
             update_interval=5
         )
+
+        # Save final results to CSV at the end of training
+        if epoch + 1 == num_epochs:
+            # Run test to get predictions, true labels, etc.
+            final_preds_scaled, final_targets_scaled = preds, targets
+
+            # Inverse transform to original scale
+            final_preds_orig = train_loader.dataset.dataset.inverse_transform_labels(final_preds_scaled)
+            final_targets_orig = train_loader.dataset.dataset.inverse_transform_labels(final_targets_scaled)
+
+            preds_np = final_preds_orig.numpy()
+            targets_np = final_targets_orig.numpy()
+
+            # Create full prediction DataFrame
+            df_full = pd.DataFrame()
+            for i, param_name in enumerate(args.model_params):
+                df_full[f"true_{param_name}"] = targets_np[:, i]
+                df_full[f"pred_{param_name}"] = preds_np[:, i]
+
+            # Save full predictions
+            os.makedirs(f"./Final_Results/{args.job_id}/", exist_ok=True)
+            df_full.to_csv(f"./Final_Results/{args.job_id}/final_predictions.csv", index=False)
+            print(f"Saved full predictions to ./Final_Results/{args.job_id}/final_predictions.csv")
+            
+            # Define what should be saved in the CSV
+            top_matches_flag = False  # Set to False to skip top matches
+            top_percent_flag = True
+
+            import re
+            from pathlib import Path
+
+            def extract_all_params_from_filename(filename):
+                """
+                Parses the filename to extract physical parameters into a dict.
+                """
+                pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
+                matches = re.findall(pattern, filename)
+                param_dict = {k.lstrip('_'): float(v) for k, v in matches}
+                
+                # Add static fields
+                param_dict["finished"] = False
+                param_dict["error"] = None
+                param_dict["full_finished"] = True
+                param_dict["full_error"] = None
+                return param_dict
+
+            variances = np.var(targets_np, axis=0)
+            weights = 1.0 / (variances + 1e-8)
+            def weighted_dist(a, b):
+                return np.sqrt(np.sum(weights * (a - b) ** 2))
+
+            from scipy.constants import pi
+            from astropy import constants as const
+            
+            def conv_density_to_env_mass(dens, ri_au, ro_au, radius_au, prho):
+                """
+                Convert reference density (rho_0) to total envelope mass in solar masses.
+
+                Args:
+                    dens (float): Reference mass density (g/cm^3).
+                    ri_au (float): Inner radius in AU.
+                    ro_au (float): Outer radius in AU.
+                    radius_au (float): Reference radius in AU.
+                    prho (float): Power-law index.
+
+                Returns:
+                    float: Envelope mass in solar masses.
+                """
+                # Convert AU to cm
+                ri = ri_au * const.au.cgs.value
+                ro = ro_au * const.au.cgs.value
+                radius = radius_au * const.au.cgs.value
+
+                # Physical constants
+                mp = const.m_p.cgs.value  # Proton mass in grams
+                factor = 2.3 * mp  # Mean mass per H2 molecule
+
+                four_pi = 4 * np.pi
+
+                if prho == 3:
+                    denom = radius**prho * four_pi * np.log(ro / ri)
+                else:
+                    denom = radius**prho * four_pi * (ro**(3 - prho) - ri**(3 - prho)) / (3 - prho)
+
+                nr_h2 = dens * denom
+                mass = nr_h2 * factor  # total mass in grams
+
+                # Convert to solar masses
+                mass_solar = mass / const.M_sun.cgs.value
+                return mass_solar
+
+            # Map from index to filename (safe against float precision mismatches)
+            index_to_filename = {i: Path(f).name for i, f in enumerate(test_loader.dataset.dataset.fits_files)}
+
+            # ---- Define physical column order from your spec ----
+            base_column_order = [
+                "D", "mass", "L", "ri", "ro", "rr", "p", "rvar", "phivar", "np",
+                "edr", "lines_mode", "ncores", "finished", "error",
+                "Tlow", "Thigh", "NCH3CN", "vin", "incl", "phi",
+                "full_finished", "full_error"
+            ]
+
+            matches = []
+            dataset = test_loader.dataset.dataset
+            subset_indices = test_loader.dataset.indices
+
+            for pred_idx, pred_vec in enumerate(preds_np):
+                original_idx = subset_indices[pred_idx]
+                filename = Path(dataset.fits_files[original_idx]).name
+
+                # Extract full physical parameters from filename
+                param_dict = extract_all_params_from_filename(filename)
+
+                for i, param in enumerate(args.model_params):
+                    param_dict[param] = pred_vec[i]
+
+                try:
+                    pred_dens = param_dict.get("D", None)
+                    ri = param_dict.get("ri", None)
+                    ro = param_dict.get("ro", None)
+                    radius = param_dict.get("rr", None)
+                    prho = param_dict.get("p", None)
+
+                    if None not in (pred_dens, ri, ro, radius, prho):
+                        mass = conv_density_to_env_mass(pred_dens, ri, ro, radius, prho)
+                        param_dict["mass"] = mass
+                    else:
+                        param_dict["mass"] = None
+                except Exception as e:
+                    print(f"[WARN] Failed to compute mass for idx={pred_idx}: {e}")
+                    param_dict["mass"] = None
+
+                # Static flags
+                param_dict["finished"] = "False"
+                param_dict["error"] = "None"
+                param_dict["full_finished"] = "True"
+                param_dict["full_error"] = "None"
+                param_dict["lines_mode"] = 1
+                param_dict["ncores"] = 4
+
+                # Match score (distance between pred and target)
+                match_score = weighted_dist(pred_vec, targets_np[pred_idx])
+                param_dict["match_score"] = match_score
+
+                matches.append(param_dict)
+
+            if top_matches_flag:
+                # ---- Sort by match score and limit to top N ----
+                count_topmatches = 10
+                # ---- Sort by score and limit to top N ----
+                matches.sort(key=lambda x: x["match_score"])
+                top_matches = matches[:count_topmatches]
+
+                csv_columns = base_column_order
+
+                # Ensure all keys are present
+                for m in top_matches:
+                    for col in csv_columns:
+                        if col not in m:
+                            m[col] = None
+
+                # ---- Write to CSV ----
+                df_top = pd.DataFrame(top_matches)[csv_columns]
+                output_dir = f"./Final_Results/{args.job_id}"
+                os.makedirs(output_dir, exist_ok=True)
+                csv_path = f"{output_dir}/top{count_topmatches}_matches.csv"
+                df_top.to_csv(csv_path, index=False)
+                print(f"Saved top {count_topmatches} matches to {csv_path}")
+
+            elif top_percent_flag:
+                percent = args.csv_percentage
+                count_random = max(1, int(len(matches) * percent))
+                print("Selecting random matches for top percent: ", count_random)
+
+                #np.random.seed(42)  # For reproducibility
+
+                top_matches = list(np.random.choice(matches, size=count_random, replace=False))
+                csv_columns = base_column_order
+
+                # Ensure all keys are present
+                for m in top_matches:
+                    for col in csv_columns:
+                        if col not in m:
+                            m[col] = None
+
+                # ---- Write to CSV ----
+                df_top = pd.DataFrame(top_matches)[csv_columns]
+                output_dir = f"./Final_Results/{args.job_id}"
+                os.makedirs(output_dir, exist_ok=True)
+                csv_path = f"{output_dir}/rnd_{percent}_percent.csv"
+                df_top.to_csv(csv_path, index=False)
+                print(f"Saved randcom {percent} percent to {csv_path}")
+
+            # Saving 10 predictions for each parameter at higher and lower regions
+            if len(matches) > 10:
+                # Sort by each parameter and save top 10
+                for param in args.model_params:
+                    sorted_matches = sorted(matches, key=lambda x: x[param])
+                    top_10 = sorted_matches[:10]
+                    bottom_10 = sorted_matches[-10:]
+
+                    # Ensure all keys are present
+                    for m in top_10 + bottom_10:
+                        for col in base_column_order:
+                            if col not in m:
+                                m[col] = None
+
+                    df_top = pd.DataFrame(top_10 + bottom_10)[base_column_order]
+                    output_dir = f"./Final_Results/{args.job_id}"
+                    os.makedirs(output_dir, exist_ok=True)
+                    csv_path = f"{output_dir}/top_bottom_10_{param}.csv"
+                    df_top.to_csv(csv_path, index=False)
+                    print(f"Saved top/bottom 10 for {param} to {csv_path}")
 
         # Checkpointing logic
         # Condition 1: Is it a checkpointing epoch?

@@ -4,13 +4,14 @@
 # Loading modules and activating venv inside srun's bash -c
 
 # --- Configuration - Needs to be updated before running! ---
-JOB_ID="13762768" # Replace with the actual JOB ID of the sleeping job
+JOB_ID="13834463" # Replace with the actual JOB ID of the sleeping job
 TRAINING_JOB_ID=" " # Replace with the actual JOB ID of the trained job to continue
 CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
 # ---Parameters to train---
-MODEL_PARAMS="Dens Lum radius prho NCH3CN incl phi" # Parameters to train on
-LOG_SCALE_PARAMS="Dens Lum NCH3CN" # Parameters to log scale during training
+#D=3.054e+09_L=6.190e+04_ri=50_ro=1596_rr=205_p=1.18_np=100000_edr=1_rvar=0.33_phivar=1.4_LTE_Tlow=86.4_Thigh=800_NCH3CN=1.0e-10_vin=0.1_incl=130_phi=334_dist=3000_0.5arcsec
+MODEL_PARAMS="D L ro rr p Tlow NCH3CN" # Parameters to train on
+LOG_SCALE_PARAMS="D L NCH3CN" # Parameters to log scale during training
 
 # --- Define Paths ---
 NODE_LOCAL_DIR="/local/nvme/${JOB_ID}_fits_data"
@@ -24,7 +25,7 @@ VENV_PATH="/p/scratch/pasta/CNN/.cnn_venv/bin/activate" # Path to your venv acti
 SAVE_DIR="${SCRIPT_DIR}/${TRAINING_JOB_ID}_model_checkpoints" # Where checkpoints are saved/loaded from
 
 # Log file for the Python script named after the job ID
-LOG_FILE="slurm_output/cnn_run_${JOB_ID}.log"
+LOG_FILE="slurm_output/cnn_run/cnn_run_${JOB_ID}.log"
 
 
 # --- Checkpoint Configuration ---
@@ -63,7 +64,7 @@ python \"${SCRIPT_PATH}\" \\
     --wavelength-stride 1 \\
     --load-preprocessed False \\
     --use-local-nvme True \\
-    --batch-size 64 \\
+    --batch-size 128 \\
     --num-workers 8 \\
     --model-depth 18  \\
     --num-epochs 40 \\

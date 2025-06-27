@@ -4,17 +4,18 @@
 # Loading modules and activating venv inside srun's bash -c
 
 # --- Configuration - Needs to be updated before running! ---
-JOB_ID="13742917" # Replace with the actual JOB ID of the sleeping job
-TRAINING_JOB_ID="" # Replace with the actual JOB ID of the trained job to continue
+JOB_ID="13837680" # Replace with the actual JOB ID of the sleeping job
+TRAINING_JOB_ID=" " # Replace with the actual JOB ID of the trained job to continue
 CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
 # ---Parameters to train---
-MODEL_PARAMS="Dens Lum radius prho NCH3CN incl phi" # Parameters to train on
-LOG_SCALE_PARAMS="Dens Lum NCH3CN" # Parameters to log scale during training
+#D=3.054e+09_L=6.190e+04_ri=50_ro=1596_rr=205_p=1.18_np=100000_edr=1_rvar=0.33_phivar=1.4_LTE_Tlow=86.4_Thigh=800_NCH3CN=1.0e-10_vin=0.1_incl=130_phi=334_dist=3000_0.5arcsec
+MODEL_PARAMS="D L ro rr p Tlow NCH3CN" # Parameters to train on
+LOG_SCALE_PARAMS="D L NCH3CN" # Parameters to log scale during training
 
 # --- Define Paths ---
 NODE_LOCAL_DIR="/local/nvme/${JOB_ID}_fits_data"
-ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100"
+ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data"
 #ORIGINAL_FILE_LIST="${ORIGINAL_FITS_SCRATCH_DIR}/file_list.txt"
 #SCALING_PARAMS_PATH="/p/scratch/pasta/production_run/CNN_Python/scaling_params.pt" # Correct path
 SCRIPT_DIR="/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN"
@@ -22,6 +23,10 @@ SCRIPT_NAME="ResNet3D.py"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
 VENV_PATH="/p/scratch/pasta/CNN/.cnn_venv/bin/activate" # Path to your venv activation script
 SAVE_DIR="${SCRIPT_DIR}/${TRAINING_JOB_ID}_model_checkpoints" # Where checkpoints are saved/loaded from
+
+# Log file for the Python script named after the job ID
+LOG_FILE="slurm_output/cnn_run/cnn_run_${JOB_ID}.log"
+
 
 # --- Checkpoint Configuration ---
 # Set this variable to the specific checkpoint file you want to resume from.
@@ -54,22 +59,22 @@ echo 'Activating venv...'
 source \"${VENV_PATH}\" || { echo 'ERROR: Failed to activate venv inside srun'; exit 1; }
 echo 'Venv activated.'
 echo 'Running python: $(which python)' # Verify python path
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python \"${SCRIPT_PATH}\" \\
+python \"${SCRIPT_PATH}\" \\
     --data-dir \"${NODE_LOCAL_DIR}\" \\
     --wavelength-stride 1 \\
     --load-preprocessed False \\
     --use-local-nvme True \\
-    --batch-size 64 \\
+    --batch-size 128 \\
     --num-workers 8 \\
     --model-depth 18  \\
-    --num-epochs 60 \\
+    --num-epochs 1 \\
     --model_params ${MODEL_PARAMS} \\
     --log-scale-params ${LOG_SCALE_PARAMS} \\
     --job_id ${JOB_ID} 
 echo 'Python script finished.'
-" | tee slurm_output/100_files/cnn_run_100.log
+" | tee "${LOG_FILE}" # Capture output to log file
 #" > "slurm_output/cnn_run.log" 2>&1 # End of bash -c command string
-
+# Optional: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 
 # Capture the exit code of srun itself
 SRUN_EXIT_CODE=$?
 echo "--- srun command finished with exit code: ${SRUN_EXIT_CODE} ---"

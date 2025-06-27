@@ -130,7 +130,15 @@ class FitsDataset(data.Dataset):
     def extract_label(self, filename):
         pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
         matches = re.findall(pattern, filename)
-        label_dict = {k.lstrip('_'): float(v) for k, v in matches}
+
+        # Fix: strip known prefixes like 'LTE_' from keys
+        label_dict = {}
+        for k, v in matches:
+            key = k.lstrip('_')
+            if key.startswith("LTE_"):
+                key = key.replace("LTE_", "")
+            label_dict[key] = float(v)
+
         if "incl" in self.model_params and "phi" in self.model_params:
             incl_rad = np.radians(label_dict.get("incl", 0.0))
             phi_rad = np.radians(label_dict.get("phi", 0.0))
@@ -147,6 +155,7 @@ class FitsDataset(data.Dataset):
             return label
         else:
             return [label_dict.get(key, 0.0) for key in self.model_params]
+
     
     def inverse_transform_labels(self, scaled_labels):
         """
@@ -206,6 +215,9 @@ class FitsDataset(data.Dataset):
             # data = normalize(data, method="zscore")
             raw_label = self.labels[idx]
 
+        #bug fixing
+        data = np.nan_to_num(data, nan=0.0)
+
         # ------------------ Process Labels ------------------
         processed_label = []
         i = 0
@@ -218,7 +230,7 @@ class FitsDataset(data.Dataset):
             else:
                 val = raw_label[i]
                 if param in self.log_scale_params:
-                    val = np.log10(max(val, 1e-9))
+                    val = np.log10(val if val > 0 else 1e-12)
                 processed_label.append(val)
                 i += 1
 
@@ -275,55 +287,53 @@ def get_scalar_label_tensor(label, model_params, log_scale_params):
         scalar_values.append(val)
     return torch.tensor(scalar_values, dtype=torch.float32)
 
-"""
-# Runtime config
-fits_dir = '/p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data'
-wavelength_stride = 1
-use_local_nvme = False  # Set to False to use original directory
+# Training and validation file grouping to split the training and validation datasets with respect to the same thermal models
+from collections import defaultdict
 
-preprocessed = True  # Set to True to load preprocessed data
+def training_val_split(data_dir, output_dir="Parameters/", job_id=None):
+    def extract_thermal_key(filename):
+        pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
+        matches = re.findall(pattern, filename)
+        param_dict = {k.lstrip('_'): v for k, v in matches}
+        thermal_keys = [param_dict.get(k, "NA") for k in ["D", "L", "ri", "ro", "rr", "p", "np", "edr", "rvar", "phivar"]]
+        return tuple(thermal_keys)
+    
+    output_dir = os.path.join(output_dir, job_id) if job_id else output_dir
+    os.makedirs(output_dir, exist_ok=True)
 
-if preprocessed == False:
-    fits_dir = '/p/scratch/pasta/production_run/24.03.25/firstCNNtest'
-    test_mode = False  # set to False for full dataset
-    max_subset_files = 100
-    # Load file list, optionally limit for test
-    all_files = glob.glob(os.path.join(fits_dir, "**", "*arcsec.fits"), recursive=True)
-    valid_files = [f for f in all_files if FitsDataset._is_valid_fits(None, f)]
+    all_fits = glob.glob(os.path.join(data_dir, "*arcsec.fits"))
+    grouped_files = defaultdict(list)
+    for path in all_fits:
+        fname = os.path.basename(path)
+        key = extract_thermal_key(fname)
+        grouped_files[key].append(path)
 
-    if test_mode:
-        selected_files = random.sample(valid_files, k=min(max_subset_files, len(valid_files)))
-    else:
-        selected_files = valid_files
+    all_keys = list(grouped_files.keys())
+    #random.seed(42)
+    random.shuffle(all_keys)
+    train_keys = all_keys[:int(0.8 * len(all_keys))]
+    val_keys = all_keys[int(0.8 * len(all_keys)):]
 
-    # Initialize Dataset 
-    print("Initializing dataset...")
-    dataset = FitsDataset(fits_dir, file_list=selected_files, wavelength_stride=wavelength_stride, use_local_nvme=use_local_nvme)
-else:
-    dataset = dataset = FitsDataset(wavelength_stride=wavelength_stride, use_local_nvme=use_local_nvme, load_preprocessed=True, preprocessed_dir=fits_dir)
+    train_files = [f for k in train_keys for f in grouped_files[k]]
+    val_files = [f for k in val_keys for f in grouped_files[k]]
 
-# Split and Load 
-dataset_size = len(dataset)
-train_size = int(0.8 * dataset_size)
-test_size = dataset_size - train_size
+    train_list_path = os.path.join(output_dir, "train_file_list.txt")
+    val_list_path = os.path.join(output_dir, "val_file_list.txt")
 
-train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    with open(train_list_path, "w") as f:
+        for line in train_files:
+            f.write(line + "\n")
 
-batch_size = 16
-start_time = time.time()
+    with open(val_list_path, "w") as f:
+        for line in val_files:
+            f.write(line + "\n")
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=128, pin_memory=False, persistent_workers=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=128, pin_memory=False, persistent_workers=True)
+    return train_list_path, val_list_path
 
-end_time = time.time()
-print(f"DataLoader creation took {end_time - start_time:.2f} seconds")
+def load_file_list(file_path):
+    with open(file_path, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
 
-
-def get_dataloaders(batch_size):
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=128, pin_memory=False, persistent_workers=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=128, pin_memory=False, persistent_workers=True)
-    return train_loader, test_loader
-"""
 def create_dataloaders(
     fits_dir,
     original_file_list_path=None,
@@ -338,6 +348,7 @@ def create_dataloaders(
     test_sampler=None,
     model_params=["Dens", "Lum", "radius", "prho"],
     log_scale_params=["Dens", "Lum"],
+    job_id=None
 ):
     # Load file list if given
     file_list = None
@@ -354,10 +365,16 @@ def create_dataloaders(
         preprocessed_dir=preprocessed_dir or fits_dir,
         model_params=model_params,
         log_scale_params=log_scale_params,
-
     )
 
-    
+    train_list_path, val_list_path = training_val_split(
+        fits_dir,
+        output_dir="Parameters/",
+        job_id=job_id
+    )
+
+    # If using a file list, load it
+    train_files, val_files = load_file_list(train_list_path), load_file_list(val_list_path)
 
     # Split
     dataset_size = len(dataset)

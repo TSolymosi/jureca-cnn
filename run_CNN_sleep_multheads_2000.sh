@@ -4,7 +4,7 @@
 # Loading modules and activating venv inside srun's bash -c
 
 # --- Configuration - Needs to be updated before running! ---
-JOB_ID="13762752" # Replace with the actual JOB ID of the sleeping job
+JOB_ID="13769126" # Replace with the actual JOB ID of the sleeping job
 TRAINING_JOB_ID=" " # Replace with the actual JOB ID of the trained job to continue
 CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
