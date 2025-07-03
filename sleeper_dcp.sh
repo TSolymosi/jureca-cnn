@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=data_stage_sleep
-#SBATCH --output=slurm_output/sleeper/sleeper_dcp_%j.out
-#SBATCH --error=slurm_output/sleeper/sleeper_dcp_%j.err
+#SBATCH --output=slurm_output/sleeper/sleeper_eval_%j.out
+#SBATCH --error=slurm_output/sleeper/sleeper_eval_%j.err
 #SBATCH --partition=dc-hwai
 #SBATCH --account=westai0043
 #SBATCH --ntasks=8
@@ -25,7 +25,7 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 
 # --- Define Paths ---
-ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data/"
+ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/production_run/01.07.25/models_with_20_variations/{/p/scratch/pasta/production_run}/Data_01.07.25_models_with_20_variations/"
 #ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
 NODE_LOCAL_DIR="/local/nvme/${SLURM_JOB_ID}_fits_data"
 # Flag file to indicate copy completion

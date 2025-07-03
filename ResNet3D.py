@@ -21,7 +21,6 @@ import functools
 print = functools.partial(print, flush=True)
 
 
-
 def get_inplanes():
     return [64, 128, 256, 512]
 
@@ -980,14 +979,12 @@ if __name__ == "__main__":
         log_scale_params = args.log_scale_params,
         job_id=args.job_id,
     )
-    # Create folder for plots
-    os.makedirs(f"plots", exist_ok=True)
 
     # Specify checkpointing directory
     checkpoint_save_dir = f"checkpoints/{args.job_id}/"
     checkpoint_load_dir = f"checkpoints/{args.load_id}"
 
-    global TARGET_PARAMETERS
+    #global TARGET_PARAMETERS
     TARGET_PARAMETERS = args.model_params
 
     max_epochs = args.num_epochs
@@ -1188,6 +1185,37 @@ if __name__ == "__main__":
             # Map from index to filename (safe against float precision mismatches)
             index_to_filename = {i: Path(f).name for i, f in enumerate(test_loader.dataset.dataset.fits_files)}
 
+            # Short name to full descriptive name mapping
+            param_name_mapping = {
+                "D": "dens",
+                "mass": "mass",
+                "L": "lum",
+                "ri": "ri",
+                "ro": "ro",
+                "rr": "radius",
+                "p": "prho",
+                "rvar": "r_dev",
+                "phivar": "phi_dev",
+                "np": "nphot",
+                "edr": "env_disk_ratio",
+                "lines_mode": "lines_mode",
+                "ncores": "ncores",
+                "finished": "finished",
+                "error": "error",
+                "Tlow": "Tlow",
+                "Thigh": "Thigh",
+                "NCH3CN": "abunch3cn",
+                "vin": "vin",
+                "incl": "incl",
+                "phi": "phi",
+                "full_finished": "full_finished",
+                "full_error": "full_error",
+                "match_score": "match_score"
+            }
+
+            def rename_keys(entry, mapping):
+                return {mapping.get(k, k): v for k, v in entry.items()}
+
             # ---- Define physical column order from your spec ----
             base_column_order = [
                 "D", "mass", "L", "ri", "ro", "rr", "p", "rvar", "phivar", "np",
@@ -1247,7 +1275,7 @@ if __name__ == "__main__":
                 matches.sort(key=lambda x: x["match_score"])
                 top_matches = matches[:count_topmatches]
 
-                csv_columns = base_column_order
+                csv_columns = [param_name_mapping.get(k, k) for k in base_column_order]
 
                 # Ensure all keys are present
                 for m in top_matches:
@@ -1257,56 +1285,53 @@ if __name__ == "__main__":
 
                 # ---- Write to CSV ----
                 df_top = pd.DataFrame(top_matches)[csv_columns]
+                df_top.rename(columns=param_name_mapping, inplace=True)
+                csv_columns = [param_name_mapping.get(k, k) for k in base_column_order]
                 output_dir = f"./Final_Results/{args.job_id}"
                 os.makedirs(output_dir, exist_ok=True)
                 csv_path = f"{output_dir}/top{count_topmatches}_matches.csv"
                 df_top.to_csv(csv_path, index=False)
                 print(f"Saved top {count_topmatches} matches to {csv_path}")
 
+            # --- Random percent subset ---
             elif top_percent_flag:
+                summary_rows = []
                 percent = args.csv_percentage
                 count_random = max(1, int(len(matches) * percent))
-                print("Selecting random matches for top percent: ", count_random)
+                selected_random = np.random.choice(matches, size=count_random, replace=False)
 
-                #np.random.seed(42)  # For reproducibility
+                for row in selected_random:
+                    row['source'] = f"random_subset_{int(percent*100)}%"
+                    summary_rows.append(row)
 
-                top_matches = list(np.random.choice(matches, size=count_random, replace=False))
-                csv_columns = base_column_order
-
-                # Ensure all keys are present
-                for m in top_matches:
-                    for col in csv_columns:
-                        if col not in m:
-                            m[col] = None
-
-                # ---- Write to CSV ----
-                df_top = pd.DataFrame(top_matches)[csv_columns]
-                output_dir = f"./Final_Results/{args.job_id}"
-                os.makedirs(output_dir, exist_ok=True)
-                csv_path = f"{output_dir}/rnd_{percent}_percent.csv"
-                df_top.to_csv(csv_path, index=False)
-                print(f"Saved randcom {percent} percent to {csv_path}")
-
-            # Saving 10 predictions for each parameter at higher and lower regions
+            # --- Top/Bottom 10 for each param ---
             if len(matches) > 10:
-                # Sort by each parameter and save top 10
                 for param in args.model_params:
                     sorted_matches = sorted(matches, key=lambda x: x[param])
                     top_10 = sorted_matches[:10]
                     bottom_10 = sorted_matches[-10:]
 
-                    # Ensure all keys are present
-                    for m in top_10 + bottom_10:
-                        for col in base_column_order:
-                            if col not in m:
-                                m[col] = None
+                    for row in top_10:
+                        row['source'] = f"top_10_{param}"
+                        summary_rows.append(row)
+                    for row in bottom_10:
+                        row['source'] = f"bottom_10_{param}"
+                        summary_rows.append(row)
 
-                    df_top = pd.DataFrame(top_10 + bottom_10)[base_column_order]
-                    output_dir = f"./Final_Results/{args.job_id}"
-                    os.makedirs(output_dir, exist_ok=True)
-                    csv_path = f"{output_dir}/top_bottom_10_{param}.csv"
-                    df_top.to_csv(csv_path, index=False)
-                    print(f"Saved top/bottom 10 for {param} to {csv_path}")
+            # --- Combine and write ---
+            df_summary = pd.DataFrame(summary_rows)
+            df_summary.rename(columns=param_name_mapping, inplace=True)
+
+            # Ensure columns
+            csv_columns = [param_name_mapping.get(k, k) for k in base_column_order] + ["match_score", "source"]
+            for col in csv_columns:
+                if col not in df_summary.columns:
+                    df_summary[col] = None
+
+            df_summary = df_summary[csv_columns]
+            csv_path = f"./Final_Results/{args.job_id}/analysis_summary.csv"
+            df_summary.to_csv(csv_path, index=False)
+            print(f"Saved combined summary to {csv_path}")
 
         # Checkpointing logic
         # Condition 1: Is it a checkpointing epoch?

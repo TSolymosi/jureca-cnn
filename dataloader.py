@@ -215,8 +215,23 @@ class FitsDataset(data.Dataset):
             # data = normalize(data, method="zscore")
             raw_label = self.labels[idx]
 
-        #bug fixing
-        data = np.nan_to_num(data, nan=0.0)
+        # --- NaN check & repair ---
+        if np.isnan(data).any():
+            nan_indices = np.argwhere(np.isnan(data))  # array of [d, h, w]
+            
+            log_file = "/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN/FileList/runtime_nan_log.txt"
+            with open(log_file, "a") as log:
+                log.write(f"\n[NaN Repair] File: {fits_path}, Shape: {data.shape}, NaN count: {len(nan_indices)}\n")
+                #for (d, h, w) in nan_indices:
+                #    log.write(f"   -> NaN at (channel={d}, y={h}, x={w})\n")
+            for d in range(data.shape[0]):
+                slice_nan = np.isnan(data[d])
+                if np.any(slice_nan):
+                    mean_val = np.nanmean(data[d])
+                    if np.isnan(mean_val):
+                        mean_val = 0.0  # or np.nanmin(data) or any safe default
+                        print(f"[WARN] Fully-NaN channel {d} in file {fits_path} — filled with {mean_val}")
+                    data[d][slice_nan] = mean_val
 
         # ------------------ Process Labels ------------------
         processed_label = []
