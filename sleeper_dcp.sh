@@ -25,22 +25,19 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 
 # --- Define Paths ---
-ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data/"
+SRC="/p/scratch/pasta/production_run/Data_24.06.25_full_wo_randomness"
+LIST="$(realpath arcsec_files.txt)"
 #ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
 NODE_LOCAL_DIR="/local/nvme/${SLURM_JOB_ID}_fits_data"
 # Flag file to indicate copy completion
 COPY_DONE_FLAG="${NODE_LOCAL_DIR}/.copy_done"
 
-# --- Name of the pre-generated dfind list (MPIFileUtils format) ---
-#PREGENERATED_DFIND_LIST_FILENAME="fits_file_list.mpi.bin" # Must match the name used in Step 1
-#PREGENERATED_DFIND_LIST_PATH="${ORIGINAL_FITS_SCRATCH_DIR}${PREGENERATED_DFIND_LIST_FILENAME}"
-# File pattern for filtering and verification
-FILE_PATTERN="*arcsec.fits"
+
 
 echo "--- Staging Data to Node-Local Storage (using dcp and pre-generated dfind list) ---"
-echo "Source directory: ${ORIGINAL_FITS_SCRATCH_DIR}"
+echo "Source directory: ${SRC}"
 echo "Node-local directory: ${NODE_LOCAL_DIR}"
-#echo "Using pre-generated dfind list: ${PREGENERATED_DFIND_LIST_PATH}"
+
 
 # Conditional copy: Only copy if the flag file doesn't exist
 if [ ! -f "${COPY_DONE_FLAG}" ]; then
@@ -54,11 +51,33 @@ if [ ! -f "${COPY_DONE_FLAG}" ]; then
 
     echo "Starting dcp..."
     TARGET_DIR_ARG="${NODE_LOCAL_DIR}"
-    #echo "Command: dcp --progress 60 \"${PREGENERATED_DFIND_LIST_PATH}\" \"${TARGET_DIR_ARG}\"" #-p --progress 60
-    echo "Command: dcp -v -p \"${ORIGINAL_FITS_SCRATCH_DIR}\" \"${TARGET_DIR_ARG}\""
+    echo "Command to be used: dcp -v -p -i List \"${TARGET_DIR_ARG}\""
     start_copy_time=$(date +%s)
-    #mpirun dcp -v --progress 60 "${PREGENERATED_DFIND_LIST_PATH}" "${TARGET_DIR_ARG}" #
-    mpirun -np 8 dcp -v -p ${ORIGINAL_FITS_SCRATCH_DIR} ${TARGET_DIR_ARG}
+
+    #mkdir -p "$(dirname "$LIST")"
+
+
+    # Use find instead of dfind — and ensure relative paths for dcp
+    #find "$SRC" -type f -name "*arcsec.fits" | sed "s|^$SRC/||" > "$LIST"
+    #find "$SRC" -type f -name "*arcsec.fits" > "$LIST"
+
+    # Debug output
+    #echo "Generated list at $LIST with $(wc -l < "$LIST") entries"
+    #head "$LIST"
+
+    # Copy to a well-known shared file location all MPI ranks can access
+    #SHARED_LIST="/p/scratch/westai0043/CNN/arcsec_files.txt"
+    #cp "$LIST" "$SHARED_LIST"
+
+    # Confirm all ranks can read it
+    #ls -l "$SHARED_LIST"
+    #head "$SHARED_LIST"
+
+
+    #echo "Running dcp with the generated list..."
+    # Run dcp with the filtered list
+    #mpirun -np 8 dcp -v -p -i "$SHARED_LIST" "$SRC" "$TARGET_DIR_ARG"
+    mpirun -np 8 dcp -v -p "$SRC" "$TARGET_DIR_ARG"
     
     dcp_exit_code=$?
     end_copy_time=$(date +%s)
@@ -71,7 +90,7 @@ if [ ! -f "${COPY_DONE_FLAG}" ]; then
         exit 1
     fi
 
-    echo "Data copy finished via dcp (pre-gen list) in ${copy_duration} seconds."
+    echo "Data copy finished via dcp in ${copy_duration} seconds."
 
     # --- Verification ---
     echo "Running verification..."
@@ -95,14 +114,14 @@ if [ ! -f "${COPY_DONE_FLAG}" ]; then
     # 3. Count copied files
     # We can't easily know the expected count without the text list,
     # but we check that *some* files matching the pattern were copied.
-    echo "Verifying copied file count..."
-    copied_files_count=$(find "${NODE_LOCAL_DIR}" -type f -name "${FILE_PATTERN}" | wc -l)
-    if [ "$copied_files_count" -eq 0 ]; then
+    #echo "Verifying copied file count..."
+    #copied_files_count=$(find "${NODE_LOCAL_DIR}" -type f -name "${FILE_PATTERN}" | wc -l)
+    #if [ "$copied_files_count" -eq 0 ]; then
         # This implies dcp failed to copy anything despite a non-empty list
-        echo "Error: Verification failed - Copied file count in destination is 0, but dfind list was non-empty."
-        verification_passed=false
-    else
-        echo "Verification: Found ${copied_files_count} copied '${FILE_PATTERN}' files in destination."
+    #    echo "Error: Verification failed - Copied file count in destination is 0, but dfind list was non-empty."
+    #    verification_passed=false
+    #else
+    #    echo "Verification: Found ${copied_files_count} copied '${FILE_PATTERN}' files in destination."
         # If you generated the text list in Step 1, you could copy *that* list name here
         # and uncomment the comparison logic if needed.
         # PREGENERATED_TXT_LIST_PATH="${ORIGINAL_FITS_SCRATCH_DIR}/fits_file_list.txt"
@@ -110,13 +129,13 @@ if [ ! -f "${COPY_DONE_FLAG}" ]; then
         #   expected_count=$(wc -l < "${PREGENERATED_TXT_LIST_PATH}")
         #   if [ "$copied_files_count" -ne "$expected_count" ]; then ... error ... fi
         # fi
-    fi
+    #fi
 
-    if [ "$verification_passed" = false ]; then
-        echo "Cleaning up failed verification in ${NODE_LOCAL_DIR}..."
-        rm -rf "${NODE_LOCAL_DIR}"
-        exit 1
-    fi
+    #if [ "$verification_passed" = false ]; then
+    #    echo "Cleaning up failed verification in ${NODE_LOCAL_DIR}..."
+    #    rm -rf "${NODE_LOCAL_DIR}"
+    #    exit 1
+    #fi
     # --- End Verification ---
 
 
@@ -134,6 +153,8 @@ fi
 echo "--- Data Staging Complete. Job is now sleeping. ---"
 echo "To run your script, use:"
 echo "srun --jobid=$SLURM_JOB_ID --cpu-bind=none --ntasks=1 --cpus-per-task=<CPUs_for_Python> python /path/to/CNN_implementation.py --data-dir ${NODE_LOCAL_DIR} ..."
+echo "Or alternatively"
+echo "bash run_CNN_sleep_multheads.sh --job_id $SLURM_JOB_ID"
 echo "(Remember to scancel $SLURM_JOB_ID when finished)"
 
 # Sleep indefinitely (or for a very long time)

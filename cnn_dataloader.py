@@ -1,3 +1,5 @@
+
+
 import torch
 import torch.utils.data as data
 from torch.utils.data import DataLoader
@@ -9,6 +11,10 @@ import shutil
 import time
 import glob
 import random
+
+# Override the default print function to flush the output immediately
+import functools
+print = functools.partial(print, flush=True)
 
 # Git version (test)
 
@@ -33,6 +39,8 @@ def normalize(data, method='minmax'):
 
 
 class FitsDataset(data.Dataset):
+    print("+++ FitsDataset class body executed +++")
+
     def __init__(
         self,
         fits_dir=None,
@@ -46,6 +54,9 @@ class FitsDataset(data.Dataset):
     ):
         self.wavelength_stride = wavelength_stride
         self.load_preprocessed = load_preprocessed
+        self.file_list = file_list
+        print("=== FitsDataset constructor entered ===")
+        
 
         self.scaler_means = None
         self.scaler_stds = None
@@ -95,15 +106,18 @@ class FitsDataset(data.Dataset):
             if file_list is not None:
                 self.fits_files = file_list
             else:
+                print(f"Searching for FITS files in: {self.fits_dir}")
                 self.fits_files = [
                     os.path.join(root, f)
                     for root, _, files in os.walk(self.fits_dir)
                     for f in files if f.endswith("arcsec.fits") and self._is_valid_fits(os.path.join(root, f))
                 ]
+                print(f"Found {len(self.fits_files)} valid FITS files in {self.fits_dir}")
 
             if len(self.fits_files) == 0:
-                raise RuntimeError("No valid FITS files found.")
+                raise RuntimeError("ERROR: No valid FITS files found.")
 
+            print("Extracting labels from FITS filenames...")
             self.labels = [self.extract_label(os.path.basename(f)) for f in self.fits_files]
             self.labels = np.array(self.labels)
             #self.label_min = self.labels.min(axis=0)
@@ -137,8 +151,46 @@ class FitsDataset(data.Dataset):
     def extract_label(self, filename):
         pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
         matches = re.findall(pattern, filename)
-        label_dict = {k.lstrip('_'): float(v) for k, v in matches}
-        return [label_dict.get(key, 0.0) for key in self.model_params]
+
+        label_dict = {}
+        for k, v in matches:
+            # Do not strip! Only normalize well-defined prefix
+            key = k
+            key = k.strip("_")  # remove any accidental leading underscores
+            if key.startswith("LTE_"):
+                key = key[len("LTE_"):]
+            label_dict[key] = float(v)
+
+        # DEBUG
+        #print(f"[extract_label] {filename}")
+        #print(f"  → Extracted: {label_dict}")
+        #print(f"  → Requested params: {self.model_params}")
+
+        label = []
+        if "incl" in self.model_params and "phi" in self.model_params:
+            incl_rad = np.radians(label_dict["incl"])
+            phi_rad = np.radians(label_dict["phi"])
+            trig_map = {
+                "incl": [np.sin(incl_rad), np.cos(incl_rad)],
+                "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
+            }
+            for param in self.model_params:
+                if param in trig_map:
+                    label.extend(trig_map[param])
+                else:
+                    if param not in label_dict:
+                        raise KeyError(f"❌ Missing parameter '{param}' in filename:\n{filename}\nExtracted: {label_dict}")
+                    label.append(label_dict[param])
+        else:
+            for param in self.model_params:
+                if param not in label_dict:
+                    raise KeyError(f"❌ Missing parameter '{param}' in filename:\n{filename}\nExtracted: {label_dict}")
+                label.append(label_dict[param])
+
+        return label
+
+
+
     
     def inverse_transform_labels(self, scaled_labels):
         """
@@ -198,6 +250,25 @@ class FitsDataset(data.Dataset):
                 # Normalize data
                 #data = normalize(data, method="zscore")
                 label = self.labels[idx]
+            
+            # --- NaN check & repair ---
+            if np.isnan(data).any():
+                nan_indices = np.argwhere(np.isnan(data))  # array of [d, h, w]
+                
+                log_file = "/p/scratch/westai0043/CNN/25.06.25/NanFits/runtime_nan_log.txt"
+                with open(log_file, "a") as log:
+                    log.write(f"\n[NaN Repair] File: {fits_path}, Shape: {data.shape}, NaN count: {len(nan_indices)}\n")
+                    #for (d, h, w) in nan_indices:
+                    #    log.write(f"   -> NaN at (channel={d}, y={h}, x={w})\n")
+                for d in range(data.shape[0]):
+                    slice_nan = np.isnan(data[d])
+                    if np.any(slice_nan):
+                        mean_val = np.nanmean(data[d])
+                        if np.isnan(mean_val):
+                            mean_val = 0.0  # or np.nanmin(data) or any safe default
+                            print(f"[WARN] Fully-NaN channel {d} in file {fits_path} — filled with {mean_val}")
+                        data[d][slice_nan] = mean_val
+
 
             # Normalize label
             #label = (np.array(label) - self.label_min) / (self.label_max - self.label_min + 1e-8)
@@ -205,7 +276,7 @@ class FitsDataset(data.Dataset):
 
             # Log scale certain parameters
             for i in self.param_indices_to_log:
-                label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-9))
+                label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-12))
 
             # Standardize using means and stds
             if self.scaler_means is not None and self.scaler_stds is not None:
@@ -230,7 +301,7 @@ def calculate_label_scaling(dataset, indices):
         label = dataset.labels[idx]
         label_tensor = torch.tensor(label, dtype=torch.float32)
         for i in param_indices_to_log:
-            label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-9))
+            label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-11))
         labels.append(label_tensor)
 
     stacked = torch.stack(labels)
@@ -311,6 +382,7 @@ def create_dataloaders(
         with open(original_file_list_path, 'r') as f:
             file_list = [line.strip() for line in f if line.strip()]
 
+    print(f"Creating dataset")
     dataset = FitsDataset(
         fits_dir=fits_dir,
         file_list=file_list,
