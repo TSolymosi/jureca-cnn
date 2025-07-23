@@ -341,7 +341,8 @@ class Spectral2DResNet(nn.Module):
                  dropout_prob=0.2, # Match old implementation
                  use_batchnorm=True, # To switch between BatchNorm and GroupNorm
                  fc_hidden_dim=512, # Hidden dim for shared FC
-                 target_params_list=None): # For named output heads
+                 target_params_list=None,
+                 num_gaussians=3): # For named output heads
         super().__init__()
 
         # --- Spectral Convolution Part ---
@@ -412,17 +413,22 @@ class Spectral2DResNet(nn.Module):
         if target_params_list is None: # Fallback if not provided
             target_params_list = [f"param_{i}" for i in range(n_outputs)]
         
+        # Define output heads
+        self.num_gaussians  = num_gaussians
+
         # Using separate heads
         self.output_heads = nn.ModuleDict()
         for param_name in target_params_list:
-            output_dim = 2 if param_name in ("incl", "phi") else 1
-            self.output_heads[param_name] = nn.Sequential(
-                nn.Linear(fc_hidden_dim, fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32),
-                nn.ReLU(),
-                nn.Linear(fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32, output_dim)
-            )
-
-
+            if param_name in ("incl", "phi"):
+                output_dim = 2
+                self.output_heads[param_name] = nn.Sequential(
+                    nn.Linear(fc_hidden_dim, fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32),
+                    nn.ReLU(),
+                    nn.Linear(fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32, output_dim)
+                )
+            else:
+                output_dim = self.num_gaussians * 3  # pi, mu, sigma for each Gaussian
+                self.output_heads[param_name] = nn.Linear(fc_hidden_dim, output_dim)
 
         # Initialize weights
         for m in self.modules():
@@ -487,10 +493,20 @@ class Spectral2DResNet(nn.Module):
         shared_features = self.shared_fc(x)
 
         outputs = []
-        for param_name in self.output_heads: # Iterate in defined order
-            outputs.append(self.output_heads[param_name](shared_features))
-        
+        for param_name in self.output_heads:
+            out = self.output_heads[param_name](shared_features)
+
+            if param_name in ("incl", "phi"):
+                outputs.append(out)
+            else:
+                K = self.num_gaussians
+                pi, mu, sigma = torch.split(out, K, dim=1)
+                pi = F.softmax(pi, dim=1)
+                sigma = F.softplus(sigma) + 1e-6
+                outputs.append(torch.cat([pi, mu, sigma], dim=1))
+
         return torch.cat(outputs, dim=1)
+
 
 
 
@@ -709,92 +725,142 @@ def load_checkpoint(model, optimizer, scaler, device, checkpoint_dir="checkpoint
 def train(model, train_loader, optimizer, criterion, device, scaler):
     model.train()
     running_loss = 0.0
+    sigma_reg_lambda = 1e-3  # Regularization strength for sigma
+
+    sigma_reg_weights = {
+    "D": 1e-3,
+    "L": 1e-3,
+    "NCH3CN": 5e-3,
+    "Tlow": 1e-3,
+    "ro": 1e-3,
+    "rr": 1e-3,
+    "p": 1e-3,
+    # Add more if needed
+}
+
+    print(f"sigma regulation parameter: {sigma_reg_lambda}")
+
+    K = model.module.num_gaussians if isinstance(model, nn.DataParallel) else model.num_gaussians
 
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
-        
-        noisy_labels = False
-        #print("Training without noisy labels.")
-        if noisy_labels:
-            # Define noise std for each scalar parameter (same order as MODEL_PARAMS)
-            per_param_std = {
-                "D": 0.5, "L": 0.5, "ro": 0.2, "rr": 0.2, "p": 0.2,
-                "Tlow": 0.1, "NCH3CN": 0.1,
-                "incl": 0.0, "phi": 0.0  # If ever added back
-            }
 
-            # Build per_target_std dynamically to match args.model_params
-            per_target_std_vals = [per_param_std.get(param, 0.0) for param in args.model_params]
-            per_target_std = torch.tensor(per_target_std_vals, device=target.device)
+        optimizer.zero_grad()
+        with autocast(device_type='cuda'):
+            output = model(data)
 
-            # Check if per_target_std matches labels shape
-            if per_target_std.shape[0] != target.shape[1]:
-                raise ValueError(f"Shape mismatch! per_target_std: {per_target_std.shape}, Labels: {target.shape}")
-            noise = torch.randn_like(target) * per_target_std
-            labels_noisy = target + noise
+            i_out = 0  # index in model output
+            i_tgt = 0  # index in target label
+            loss_total = 0.0
 
-            optimizer.zero_grad()
-            with autocast(device_type='cuda'):
-                output = model(data)
-                loss = criterion(output, labels_noisy)
-        else:
-            optimizer.zero_grad()
-            with autocast(device_type='cuda'):
-                output = model(data)
-                loss = criterion(output, target)
+            for param in args.model_params:
+                if param in ("incl", "phi"):
+                    # 2D sin/cos — standard Huber
+                    loss_total += criterion(output[:, i_out:i_out+2], target[:, i_out:i_out+2])
+                    i_out += 2
+                    i_tgt += 2
+                else:
+                    # MDN — extract and apply loss
+                    dens_output = output[:, i_out:i_out+3*K]
+                    pi, mu, sigma = torch.split(dens_output, K, dim=1)
+                    pi = F.softmax(pi, dim=1)
+                    sigma = F.softplus(sigma) + 1e-6
+                    # Ensure sigma is within a reasonable range
+                    if param == "NCH3CN":
+                        sigma = torch.clamp(sigma, min=1e-3, max=0.5)
+                    else:
+                        sigma = torch.clamp(sigma, min=1e-3, max=10.0)
 
-        scaler.scale(loss).backward()
+                    y_true = target[:, i_tgt]
+
+                    nll = mdn_loss_single_param(y_true, pi, mu, sigma)
+
+                    # Regularization on sigma: encourage smaller stds
+                    sigma_reg_weight = sigma_reg_weights.get(param, sigma_reg_lambda)
+                    sigma_reg = torch.log(sigma + 1e-6).mean()
+                    loss_total += nll + sigma_reg_weight * sigma_reg
+
+
+                    i_out += 3*K
+                    i_tgt += 1
+
+        scaler.scale(loss_total).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        running_loss += loss.item()
-    
-    return running_loss / len(train_loader)
+        running_loss += loss_total.item()
 
+    return running_loss / len(train_loader)
 
 def test(model, test_loader, criterion, device, epoch):
     model.eval()
     test_loss = 0.0
     all_preds = []
     all_targets = []
-
     loss_per_param = {param: [] for param in args.model_params}
+    K = model.module.num_gaussians if isinstance(model, nn.DataParallel) else model.num_gaussians
+
+    # --- Run model once on full test set to extract raw output for uncertainty ---
+    all_raw_outputs = []
+    with torch.no_grad():
+        for data, _ in test_loader:
+            data = data.to(device)
+            with autocast(device_type="cuda"):
+                raw_out = model(data)
+            all_raw_outputs.append(raw_out.cpu())
+    raw_output_full = torch.cat(all_raw_outputs, dim=0)
 
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
+
             with autocast(device_type='cuda'):
                 output = model(data)
-                loss = criterion(output, target)
 
-                # Per-parameter loss (still raw sin/cos)
-                for i, param in enumerate(args.model_params):
+                i_out = 0
+                i_tgt = 0
+                loss_total = 0.0
+                pred_processed = []
+
+                for param in args.model_params:
                     if param in ("incl", "phi"):
-                        loss_per_param[param].append(0)  # skip — use angular MAE later
+                        pred_processed.append(output[:, i_out:i_out+2])
+                        loss_per_param[param].append(0)
+                        loss_total += criterion(output[:, i_out:i_out+2], target[:, i_out:i_out+2])
+                        i_out += 2
+                        i_tgt += 2
                     else:
-                        param_idx = args.model_params.index(param)
-                        loss_per_param[param].append(criterion(output[:, param_idx], target[:, param_idx]).item())
+                        mdn_output = output[:, i_out:i_out+3*K]
+                        pi, mu, sigma = torch.split(mdn_output, K, dim=1)
+                        pi = F.softmax(pi, dim=1)
+                        sigma = F.softplus(sigma) + 1e-6
+                        expected_val = torch.sum(pi * mu, dim=1, keepdim=True)
+                        pred_processed.append(expected_val)
 
-                test_loss += loss.item()
-            all_preds.append(output.cpu())
-            all_targets.append(target.cpu())
+                        loss = mdn_loss_single_param(target[:, i_tgt], pi, mu, sigma)
+                        loss_per_param[param].append(loss.item())
+                        loss_total += loss
+
+                        i_out += 3*K
+                        i_tgt += 1
+
+                test_loss += loss_total.item()
+                all_preds.append(torch.cat(pred_processed, dim=1).cpu())
+                all_targets.append(target.cpu())
 
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
-
     avg_test_loss = test_loss / len(test_loader)
+
     print(f"\nTest Loss: {avg_test_loss:.4f}")
     print("Loss per parameter:")
     for param, losses in loss_per_param.items():
-        if isinstance(losses, list) and losses and losses[0] != 0:
+        if losses and losses[0] != 0:
             print(f"  {param}: {np.mean(losses):.4f}")
 
-    # Decode predictions and targets
     decoded_preds = decode_model_output(all_preds, args.model_params, test_loader.dataset)
     decoded_targets = decode_model_output(all_targets, args.model_params, test_loader.dataset)
 
-
-    # Compute angular MAE manually
     if "incl" in args.model_params:
         incl_idx = args.model_params.index("incl")
         incl_error = np.abs((decoded_preds[:, incl_idx] - decoded_targets[:, incl_idx] + 180) % 360 - 180)
@@ -805,6 +871,7 @@ def test(model, test_loader, criterion, device, epoch):
         phi_error = np.abs((decoded_preds[:, phi_idx] - decoded_targets[:, phi_idx] + 180) % 360 - 180)
         print(f"  phi  MAE: {phi_error.mean():.2f}°")
 
+    # --- PLOTTING ---
     print("Generating predicted vs. true plots...")
     PNG_DIR = f"./Epoch_Plots/{args.job_id}/"
     os.makedirs(PNG_DIR, exist_ok=True)
@@ -814,22 +881,82 @@ def test(model, test_loader, criterion, device, epoch):
         pred_vals = decoded_preds[:, i]
 
         plt.figure(figsize=(7, 7))
-        if param in args.log_scale_params:
+        log_scale = param in args.log_scale_params
+        if log_scale:
             plt.xscale('log')
             plt.yscale('log')
             plt.title(f"Epoch {epoch+1} - {param} (Log-Log Scale)")
-            mask = (true_vals > 0) & (pred_vals > 0)
-            if np.any(mask):
-                plt.scatter(true_vals[mask], pred_vals[mask], alpha=0.3, s=10)
-                min_val = min(true_vals[mask].min(), pred_vals[mask].min())
-                max_val = max(true_vals[mask].max(), pred_vals[mask].max())
-                plt.plot([min_val, max_val], [min_val, max_val], 'r--')
         else:
             plt.title(f"Epoch {epoch+1} - {param} (Linear Scale)")
-            plt.scatter(true_vals, pred_vals, alpha=0.3, s=10)
-            min_val = min(true_vals.min(), pred_vals.min())
-            max_val = max(true_vals.max(), pred_vals.max())
+
+        mask = (true_vals > 0) & (pred_vals > 0) if log_scale else np.ones_like(true_vals, dtype=bool)
+        if param == "NCH3CN":
+            print("NCH3CN pred min/max:", pred_vals.min(), pred_vals.max())
+            print("NCH3CN true min/max:", true_vals.min(), true_vals.max())
+            idx = args.model_params.index("NCH3CN")
+            true = decoded_targets[:, idx]
+            pred = decoded_preds[:, idx]
+
+            log_true = np.log10(true.clip(min=1e-12))
+            log_pred = np.log10(pred.clip(min=1e-12))
+
+            log_mae = np.abs(log_true - log_pred).mean()
+            print(f"NCH3CN log10-space MAE: {log_mae:.4f}")
+
+
+        vals_x = true_vals[mask]
+        vals_y = pred_vals[mask]
+
+        if param not in ("incl", "phi"):
+            # Get raw MDN output for this param
+            param_idx = args.model_params.index(param)
+            i_out = 0
+            for j, p in enumerate(args.model_params):
+                if p == param:
+                    break
+                if p in ("incl", "phi"):
+                    i_out += 2
+                else:
+                    i_out += 3 * K
+
+            mdn_slice = raw_output_full[:, i_out:i_out + 3 * K]
+            pi, mu, sigma = torch.split(mdn_slice, K, dim=1)
+            pi = F.softmax(pi, dim=1)
+            sigma = F.softplus(sigma) + 1e-6
+            mu_exp = torch.sum(pi * mu, dim=1, keepdim=True)
+            var = torch.sum(pi * (sigma ** 2 + (mu - mu_exp) ** 2), dim=1)
+            std = torch.sqrt(var).cpu().numpy()
+            std_clipped = np.clip(std[mask], a_min=1e-8, a_max=None)
+
+            # Prepare error bars
+            if log_scale:
+                pred_upper = 10 ** (np.log10(vals_y) + std_clipped)
+                pred_lower = 10 ** (np.log10(vals_y) - std_clipped)
+            else:
+                pred_upper = vals_y + std_clipped
+                pred_lower = np.clip(vals_y - std_clipped, a_min=1e-8, a_max=None)
+            yerr = [np.abs(vals_y - pred_lower), np.abs(pred_upper - vals_y)]
+
+            # Define consistent plot limits based on data, not error bars
+            combined = np.concatenate([vals_x, vals_y])
+            eps = 1e-15  # allow small real values, just avoid log(0)
+            min_val = max(combined.min(), eps) * 0.9
+            max_val = combined.max() * 1.1
+
+
+            # Plot identity line and error bars
             plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+            plt.errorbar(vals_x, vals_y, yerr=yerr, fmt='o', alpha=0.3, markersize=3, capsize=2)
+
+            plt.xlim([min_val, max_val])
+            plt.ylim([min_val, max_val])
+        else:
+            plt.scatter(vals_x, vals_y, alpha=0.3, s=10)
+            min_val = min(vals_x.min(), vals_y.min())
+            max_val = max(vals_x.max(), vals_y.max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+            plt.xlim([min_val, max_val])
+            plt.ylim([min_val, max_val])
 
         plt.xlabel(f"True {param}")
         plt.ylabel(f"Predicted {param}")
@@ -839,6 +966,7 @@ def test(model, test_loader, criterion, device, epoch):
         plt.close()
 
     return avg_test_loss, all_preds, all_targets, loss_per_param
+
 
 
 
@@ -1011,7 +1139,7 @@ if __name__ == "__main__":
     print(f"Model depth: {args.model_depth}")
     model_depth = args.model_depth
     #model = generate_model(model_depth=model_depth, n_outputs=num_outputs)
-    model = generate_2d_model(config_name=f"resnet{model_depth}_2d",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs)
+    model = generate_2d_model(config_name=f"resnet{model_depth}_2d",use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs, num_gaussians=3)
     
 
     # Trying to use multi GPUs 
@@ -1022,11 +1150,35 @@ if __name__ == "__main__":
 
     model = model.to(device)
 
+    import torch.distributions as dist
+
+    def mdn_loss_single_param(y, pi, mu, sigma):
+        """
+        Computes negative log-likelihood loss for a single scalar target (e.g., 'Dens').
+
+        Args:
+            y (Tensor): True labels, shape (B,)
+            pi (Tensor): Mixture weights, shape (B, K)
+            mu (Tensor): Mixture means, shape (B, K)
+            sigma (Tensor): Mixture stds, shape (B, K)
+
+        Returns:
+            Tensor: Scalar loss value
+        """
+        y = y.unsqueeze(1)  # shape (B, 1)
+        normal_dists = dist.Normal(loc=mu, scale=sigma)     # shape: (B, K)
+        log_probs = normal_dists.log_prob(y)                # shape: (B, K)
+        weighted = log_probs + torch.log(pi + 1e-8)          # log(π * p(y))
+        log_sum = torch.logsumexp(weighted, dim=1)          # log ∑ (πₖ · pₖ(y))
+        return -log_sum.mean()
+
+
     criterion = nn.HuberLoss(delta=0.1, reduction='mean')
+
     optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0)
     scaler = GradScaler('cuda')
-    scheduler = None
-    #scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=1e-6)
+    #scheduler = None
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=1e-6)
 
     # Print criterion, optimizer, scaler and scheduler information
     print(f"Criterion: {criterion}")

@@ -139,17 +139,30 @@ class FitsDataset(data.Dataset):
                 key = key.replace("LTE_", "")
             label_dict[key] = float(v)
 
-        if "incl" in self.model_params and "phi" in self.model_params:
-            incl_rad = np.radians(label_dict.get("incl", 0.0))
-            phi_rad = np.radians(label_dict.get("phi", 0.0))
-            trig_map = {
-                "incl": [np.sin(incl_rad), np.cos(incl_rad)],
-                "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
-            }
+        # if "incl" in self.model_params and "phi" in self.model_params:
+        #     incl_rad = np.radians(label_dict.get("incl", 0.0))
+        #     phi_rad = np.radians(label_dict.get("phi", 0.0))
+        #     trig_map = {
+        #         "incl": [np.sin(incl_rad), np.cos(incl_rad)],
+        #         "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
+        #     }
+        #     label = []
+        #     for param in self.model_params:
+        #         if param in trig_map:
+        #             label.extend(trig_map[param])  # adds 2 values
+        #         else:
+        #             label.append(label_dict.get(param, 0.0))
+        #     return label
+        if "plummer_shape" in self.model_params:
+            rr = label_dict.get("rr", 0.0)
+            p = label_dict.get("p", 0.0)
+
+            val = p * np.log10(rr + 1e-12)  # Avoid log(0)
+
             label = []
             for param in self.model_params:
-                if param in trig_map:
-                    label.extend(trig_map[param])  # adds 2 values
+                if param == "plummer_shape":
+                    label.append(val)
                 else:
                     label.append(label_dict.get(param, 0.0))
             return label
