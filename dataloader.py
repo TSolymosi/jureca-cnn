@@ -10,6 +10,13 @@ import time
 import glob
 import random
 
+# Override the default print function to flush the output immediately
+import functools
+print = functools.partial(print, flush=True)
+
+seed=42
+random.seed(seed)  # For reproducibility
+
 # Git version (test)
 
 def normalize(data, method='minmax'):
@@ -33,6 +40,8 @@ def normalize(data, method='minmax'):
 
 
 class FitsDataset(data.Dataset):
+    print("+++ FitsDataset class body executed +++")
+
     def __init__(
         self,
         fits_dir=None,
@@ -41,16 +50,17 @@ class FitsDataset(data.Dataset):
         use_local_nvme=True,
         load_preprocessed=False,
         preprocessed_dir='/p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data',
-        model_params=["Dens", "Lum", "radius", "prho"],
-        log_scale_params=["Dens", "Lum"],
+        model_params=["D", "L", "rr", "p"],
+        log_scale_params=["D", "L"],
     ):
         self.wavelength_stride = wavelength_stride
         self.load_preprocessed = load_preprocessed
+        self.file_list = file_list
+        print("=== FitsDataset constructor entered ===")
+        
 
         self.scaler_means = None
         self.scaler_stds = None
-        #self.expected_keys = ["Dens", "Lum", "radius", "prho"]#, "NCH3CN", "incl", "phi"]
-        #self.log_scale_params = ["Dens", "Lum"]  # Parameters to be log-scaled
         self.model_params = model_params
         self.log_scale_params = log_scale_params
         self.param_indices_to_log = [self.model_params.index(p) for p in self.log_scale_params if p in self.model_params]
@@ -95,15 +105,18 @@ class FitsDataset(data.Dataset):
             if file_list is not None:
                 self.fits_files = file_list
             else:
+                print(f"Searching for FITS files in: {self.fits_dir}")
                 self.fits_files = [
                     os.path.join(root, f)
                     for root, _, files in os.walk(self.fits_dir)
-                    for f in files if f.endswith("arcsec.fits")
+                    for f in files if f.endswith("arcsec.fits") and self._is_valid_fits(os.path.join(root, f))
                 ]
+                print(f"Found {len(self.fits_files)} valid FITS files in {self.fits_dir}")
 
             if len(self.fits_files) == 0:
-                raise RuntimeError("No valid FITS files found.")
+                raise RuntimeError("ERROR: No valid FITS files found.")
 
+            print("Extracting labels from FITS filenames...")
             self.labels = [self.extract_label(os.path.basename(f)) for f in self.fits_files]
             self.labels = np.array(self.labels)
             #self.label_min = self.labels.min(axis=0)
@@ -114,6 +127,13 @@ class FitsDataset(data.Dataset):
             #np.save("Parameters/label_min.npy", self.label_min)
             #np.save("Parameters/label_max.npy", self.label_max)
 
+    def _is_valid_fits(self, file_path):
+        #try:
+        #    with fits.open(file_path, memmap=True) as hdul:
+        #        return hdul[0].data is not None
+        #except Exception:
+        #    return False
+        return True
         
     def set_scaling_params(self, means, stds):
         self.scaler_means = means
@@ -131,43 +151,66 @@ class FitsDataset(data.Dataset):
         pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
         matches = re.findall(pattern, filename)
 
-        # Fix: strip known prefixes like 'LTE_' from keys
         label_dict = {}
         for k, v in matches:
-            key = k.lstrip('_')
+            # Do not strip! Only normalize well-defined prefix
+            key = k
+            key = k.strip("_")  # remove any accidental leading underscores
             if key.startswith("LTE_"):
-                key = key.replace("LTE_", "")
+                key = key[len("LTE_"):]
             label_dict[key] = float(v)
 
-        # if "incl" in self.model_params and "phi" in self.model_params:
-        #     incl_rad = np.radians(label_dict.get("incl", 0.0))
-        #     phi_rad = np.radians(label_dict.get("phi", 0.0))
-        #     trig_map = {
-        #         "incl": [np.sin(incl_rad), np.cos(incl_rad)],
-        #         "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
-        #     }
-        #     label = []
-        #     for param in self.model_params:
-        #         if param in trig_map:
-        #             label.extend(trig_map[param])  # adds 2 values
-        #         else:
-        #             label.append(label_dict.get(param, 0.0))
-        #     return label
-        if "plummer_shape" in self.model_params:
-            rr = label_dict.get("rr", 0.0)
-            p = label_dict.get("p", 0.0)
+        # DEBUG
+        #print(f"[extract_label] {filename}")
+        #print(f"  → Extracted: {label_dict}")
+        #print(f"  → Requested params: {self.model_params}")
 
-            val = p * np.log10(rr + 1e-12)  # Avoid log(0)
-
-            label = []
+        label = []
+        if "incl" in self.model_params and "phi" in self.model_params:
+            if "plummer_shape" in self.model_params:
+                raise ValueError("Cannot use 'plummer_shape' with 'incl' and 'phi' parameters together. Choose one set.")
+            incl_rad = np.radians(label_dict["incl"])
+            phi_rad = np.radians(label_dict["phi"])
+            trig_map = {
+                "incl": [np.sin(incl_rad), np.cos(incl_rad)],
+                "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
+            }
+            for param in self.model_params:
+                if param in trig_map:
+                    label.extend(trig_map[param])
+                else:
+                    if param not in label_dict:
+                        raise KeyError(f"❌ Missing parameter '{param}' in filename:\n{filename}\nExtracted: {label_dict}")
+                    label.append(label_dict[param])
+        else:
             for param in self.model_params:
                 if param == "plummer_shape":
-                    label.append(val)
-                else:
-                    label.append(label_dict.get(param, 0.0))
-            return label
-        else:
-            return [label_dict.get(key, 0.0) for key in self.model_params]
+                    # This is our special derived parameter.
+                    # Get its components from the dictionary.
+                    p_val = label_dict.get('p')
+                    rr_val = label_dict.get('rr')
+
+                    # Check that the components were found in the filename.
+                    if p_val is None or rr_val is None:
+                        raise KeyError(f"To compute 'plummer_shape', both 'p' and 'rr' must be in the filename's labels. File: {filename}")
+
+                    # Perform a safety check for the log operation.
+                    if rr_val <= 0:
+                        raise ValueError(f"Cannot compute log of non-positive radius={rr_val} for 'plummer_shape'. File: {filename}")
+
+                    # Calculate the derived value and append it. We use log10 for consistency.
+                    derived_value = p_val * np.log10(rr_val)
+                    label.append(derived_value)
+                if param not in label_dict and param != "plummer_shape":
+                    raise KeyError(f"❌ Missing parameter '{param}' in filename:\n{filename}\nExtracted: {label_dict}")
+                if param != "plummer_shape":
+                    # Normal parameters
+                    label.append(label_dict[param])
+
+        return label
+    
+
+
 
     
     def inverse_transform_labels(self, scaled_labels):
@@ -204,98 +247,138 @@ class FitsDataset(data.Dataset):
             else:
                 original[:, idx] = torch.pow(10.0, original[:, idx])
 
-        return original 
+        return original
+
+    def inverse_transform_labels_with_uncertainty(self, scaled_mu, scaled_sigma):
+        """
+        Inverse transform predicted means and uncertainties from scaled space
+        back to original physical units.
+
+        Args:
+            scaled_mu (torch.Tensor): Scaled predicted means, shape (B, N)
+            scaled_sigma (torch.Tensor): Scaled predicted stddevs, shape (B, N)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (mu_original, sigma_original)
+        """
+        if self.scaler_means is None or self.scaler_stds is None:
+            print("[WARNING] inverse_transform_labels_with_uncertainty called without scaler parameters.")
+            return scaled_mu, scaled_sigma
+
+        means = self.scaler_means
+        stds = self.scaler_stds
+
+        if not isinstance(scaled_mu, torch.Tensor):
+            scaled_mu = torch.from_numpy(scaled_mu)
+        if not isinstance(scaled_sigma, torch.Tensor):
+            scaled_sigma = torch.from_numpy(scaled_sigma)
+
+        scaled_mu = scaled_mu.to(means.device)
+        scaled_sigma = scaled_sigma.to(means.device)
+
+        unscaled_mu = scaled_mu * stds + means
+        unscaled_sigma = scaled_sigma * stds
+
+        mu_orig = unscaled_mu.clone()
+        sigma_orig = unscaled_sigma.clone()
+
+        for idx in self.param_indices_to_log:
+            mu_log = unscaled_mu[:, idx]
+            sigma_log = unscaled_sigma[:, idx]
+
+            # Convert mu ± sigma from log space to linear space
+            upper = torch.pow(10.0, mu_log + sigma_log)
+            lower = torch.pow(10.0, mu_log - sigma_log)
+
+            mu_orig[:, idx] = torch.pow(10.0, mu_log)
+            sigma_orig[:, idx] = (upper - lower) / 2.0
+
+        return mu_orig, sigma_orig
+
 
 
     def __len__(self):
         return len(self.data_files if self.load_preprocessed else self.fits_files)
 
     def __getitem__(self, idx):
-        # ------------------ Load Data ------------------
-        if self.load_preprocessed:
-            data = np.load(self.data_files[idx])
-            raw_label = self.labels[idx]
-        else:
-            fits_path = self.fits_files[idx]
-            with fits.open(fits_path, memmap=True) as hdul:
-                data = hdul[0].data
-            if data is None:
-                raise ValueError(f"Data is None in FITS file: {fits_path}")
-            if self.wavelength_stride > 1:
-                data = data[::self.wavelength_stride]
-
-            # Normalize data
-            # data = normalize(data, method="zscore")
-            raw_label = self.labels[idx]
-
-        # --- NaN check & repair ---
-        if np.isnan(data).any():
-            nan_indices = np.argwhere(np.isnan(data))  # array of [d, h, w]
-            
-            log_file = "/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN/FileList/runtime_nan_log.txt"
-            with open(log_file, "a") as log:
-                log.write(f"\n[NaN Repair] File: {fits_path}, Shape: {data.shape}, NaN count: {len(nan_indices)}\n")
-                #for (d, h, w) in nan_indices:
-                #    log.write(f"   -> NaN at (channel={d}, y={h}, x={w})\n")
-            for d in range(data.shape[0]):
-                slice_nan = np.isnan(data[d])
-                if np.any(slice_nan):
-                    mean_val = np.nanmean(data[d])
-                    if np.isnan(mean_val):
-                        mean_val = 0.0  # or np.nanmin(data) or any safe default
-                        print(f"[WARN] Fully-NaN channel {d} in file {fits_path} — filled with {mean_val}")
-                    data[d][slice_nan] = mean_val
-
-        # ------------------ Process Labels ------------------
-        processed_label = []
-        i = 0
-        for param in self.model_params:
-            if param in ("incl", "phi"):
-                # Already in sin/cos from extract_label
-                processed_label.append(raw_label[i])
-                processed_label.append(raw_label[i+1])
-                i += 2
+        try:
+            if self.load_preprocessed:
+                data = np.load(self.data_files[idx])
+                label = self.labels[idx]
             else:
-                val = raw_label[i]
-                if param in self.log_scale_params:
-                    val = np.log10(val if val > 0 else 1e-12)
-                processed_label.append(val)
-                i += 1
+                fits_path = self.fits_files[idx]
+                with fits.open(fits_path, memmap=True) as hdul:
+                    data = hdul[0].data
+                if data is None:
+                    raise ValueError(f"Data is None in FITS file: {fits_path}")
+                if self.wavelength_stride > 1:
+                    # Downsample data
+                    data = data[::self.wavelength_stride]
+                    
+                # Normalize data
+                #data = normalize(data, method="zscore")
+                label = self.labels[idx]
+            
+            # --- NaN check & repair ---
+            if np.isnan(data).any():
+                nan_indices = np.argwhere(np.isnan(data))  # array of [d, h, w]
+                
+                log_file = "/p/scratch/westai0043/CNN/25.06.25/NanFits/runtime_nan_log.txt"
+                with open(log_file, "a") as log:
+                    log.write(f"\n[NaN Repair] File: {fits_path}, Shape: {data.shape}, NaN count: {len(nan_indices)}\n")
+                    #for (d, h, w) in nan_indices:
+                    #    log.write(f"   -> NaN at (channel={d}, y={h}, x={w})\n")
+                for d in range(data.shape[0]):
+                    slice_nan = np.isnan(data[d])
+                    if np.any(slice_nan):
+                        mean_val = np.nanmean(data[d])
+                        if np.isnan(mean_val):
+                            mean_val = 0.0  # or np.nanmin(data) or any safe default
+                            print(f"[WARN] Fully-NaN channel {d} in file {fits_path} — filled with {mean_val}")
+                        data[d][slice_nan] = mean_val
 
-        label_tensor = torch.tensor(processed_label, dtype=torch.float32)
 
-        # Standardize if applicable
-        if self.scaler_means is not None and self.scaler_stds is not None:
-            label_tensor = label_tensor.clone()
-            j = 0  # index into scaler_means/stds
-            i = 0  # index into label_tensor
-            while i < len(label_tensor):
-                param = self.model_params[j]
-                if param in ("incl", "phi"):
-                    i += 2  # skip sin and cos
-                else:
-                    label_tensor[i] = (label_tensor[i] - self.scaler_means[j]) / self.scaler_stds[j]
-                    i += 1
-                j += 1
+            # Normalize label
+            #label = (np.array(label) - self.label_min) / (self.label_max - self.label_min + 1e-8)
+            label_tensor = torch.tensor(label, dtype=torch.float32)
 
-        else:
-            print("[WARNING] No scaling parameters provided. Using raw labels.")
+            # Log scale certain parameters
+            for i in self.param_indices_to_log:
+                label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-12))
 
-        # ------------------ Convert Data ------------------
-        data = torch.tensor(data.astype(np.float32, copy=False), dtype=torch.float32).unsqueeze(0)
+            # Standardize using means and stds
+            if self.scaler_means is not None and self.scaler_stds is not None:
+                label_tensor = (label_tensor - self.scaler_means) / self.scaler_stds
+            else:
+                print("[WARNING] No scaling parameters provided. Using raw labels.")
+
+            
 
 
+            # Return as tensors
+            data = torch.tensor(data.astype(np.float32, copy=False), dtype=torch.float32).unsqueeze(0)
+        except Exception as e:
+            print(f"[ERROR] Failed on index {idx}, file: {self.file_list[idx]}")
+            raise e
         return data, label_tensor
 
-    
-def calculate_label_scaling(dataset, indices):
+def calculate_label_scaling(full_dataset, indices): # `full_dataset` could be a Subset
     labels = []
-    param_indices_to_log = [dataset.model_params.index(p) for p in dataset.log_scale_params if p in dataset.model_params]
+    
+    # Access the underlying dataset if we're dealing with a Subset
+    original_dataset = full_dataset.dataset if isinstance(full_dataset, torch.utils.data.Subset) else full_dataset
+    
+    # Use the attributes from the original dataset
+    param_indices_to_log = [original_dataset.model_params.index(p) for p in original_dataset.log_scale_params if p in original_dataset.model_params]
+    
     for idx in indices:
-        label = dataset.labels[idx]
+        # Get the label from the original dataset's full label list
+        label = original_dataset.labels[idx] 
+   
+
         label_tensor = torch.tensor(label, dtype=torch.float32)
         for i in param_indices_to_log:
-            label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-9))
+            label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-11))
         labels.append(label_tensor)
 
     stacked = torch.stack(labels)
@@ -304,64 +387,57 @@ def calculate_label_scaling(dataset, indices):
     stds[stds == 0] = 1.0
     return means, stds
 
-def get_scalar_label_tensor(label, model_params, log_scale_params):
-    scalar_values = []
-    for i, param in enumerate(model_params):
-        if param in ("incl", "phi"):
-            continue
-        val = label[i]
-        if param in log_scale_params:
-            val = np.log10(max(val, 1e-9))
-        scalar_values.append(val)
-    return torch.tensor(scalar_values, dtype=torch.float32)
 
-# Training and validation file grouping to split the training and validation datasets with respect to the same thermal models
-from collections import defaultdict
 
-def training_val_split(data_dir, output_dir="Parameters/", job_id=None):
-    def extract_thermal_key(filename):
-        pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
-        matches = re.findall(pattern, filename)
-        param_dict = {k.lstrip('_'): v for k, v in matches}
-        thermal_keys = [param_dict.get(k, "NA") for k in ["D", "L", "ri", "ro", "rr", "p", "np", "edr", "rvar", "phivar"]]
-        return tuple(thermal_keys)
-    
-    output_dir = os.path.join(output_dir, job_id) if job_id else output_dir
-    os.makedirs(output_dir, exist_ok=True)
+"""
+# Runtime config
+fits_dir = '/p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data'
+wavelength_stride = 1
+use_local_nvme = False  # Set to False to use original directory
 
-    all_fits = glob.glob(os.path.join(data_dir, "*arcsec.fits"))
-    grouped_files = defaultdict(list)
-    for path in all_fits:
-        fname = os.path.basename(path)
-        key = extract_thermal_key(fname)
-        grouped_files[key].append(path)
+preprocessed = True  # Set to True to load preprocessed data
 
-    all_keys = list(grouped_files.keys())
-    #random.seed(42)
-    random.shuffle(all_keys)
-    train_keys = all_keys[:int(0.8 * len(all_keys))]
-    val_keys = all_keys[int(0.8 * len(all_keys)):]
+if preprocessed == False:
+    fits_dir = '/p/scratch/pasta/production_run/24.03.25/firstCNNtest'
+    test_mode = False  # set to False for full dataset
+    max_subset_files = 100
+    # Load file list, optionally limit for test
+    all_files = glob.glob(os.path.join(fits_dir, "**", "*arcsec.fits"), recursive=True)
+    valid_files = [f for f in all_files if FitsDataset._is_valid_fits(None, f)]
 
-    train_files = [f for k in train_keys for f in grouped_files[k]]
-    val_files = [f for k in val_keys for f in grouped_files[k]]
+    if test_mode:
+        selected_files = random.sample(valid_files, k=min(max_subset_files, len(valid_files)))
+    else:
+        selected_files = valid_files
 
-    train_list_path = os.path.join(output_dir, "train_file_list.txt")
-    val_list_path = os.path.join(output_dir, "val_file_list.txt")
+    # Initialize Dataset 
+    print("Initializing dataset...")
+    dataset = FitsDataset(fits_dir, file_list=selected_files, wavelength_stride=wavelength_stride, use_local_nvme=use_local_nvme)
+else:
+    dataset = dataset = FitsDataset(wavelength_stride=wavelength_stride, use_local_nvme=use_local_nvme, load_preprocessed=True, preprocessed_dir=fits_dir)
 
-    with open(train_list_path, "w") as f:
-        for line in train_files:
-            f.write(line + "\n")
+# Split and Load 
+dataset_size = len(dataset)
+train_size = int(0.8 * dataset_size)
+test_size = dataset_size - train_size
 
-    with open(val_list_path, "w") as f:
-        for line in val_files:
-            f.write(line + "\n")
+train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
 
-    return train_list_path, val_list_path
+batch_size = 16
+start_time = time.time()
 
-def load_file_list(file_path):
-    with open(file_path, 'r') as f:
-        return [line.strip() for line in f if line.strip()]
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=128, pin_memory=False, persistent_workers=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=128, pin_memory=False, persistent_workers=True)
 
+end_time = time.time()
+print(f"DataLoader creation took {end_time - start_time:.2f} seconds")
+
+
+def get_dataloaders(batch_size):
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=128, pin_memory=False, persistent_workers=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=128, pin_memory=False, persistent_workers=True)
+    return train_loader, test_loader
+"""
 def create_dataloaders(
     fits_dir,
     original_file_list_path=None,
@@ -376,7 +452,7 @@ def create_dataloaders(
     test_sampler=None,
     model_params=["Dens", "Lum", "radius", "prho"],
     log_scale_params=["Dens", "Lum"],
-    job_id=None
+    data_subset_fraction=1.0,
 ):
     # Load file list if given
     file_list = None
@@ -384,6 +460,7 @@ def create_dataloaders(
         with open(original_file_list_path, 'r') as f:
             file_list = [line.strip() for line in f if line.strip()]
 
+    print(f"Creating dataset")
     dataset = FitsDataset(
         fits_dir=fits_dir,
         file_list=file_list,
@@ -393,16 +470,25 @@ def create_dataloaders(
         preprocessed_dir=preprocessed_dir or fits_dir,
         model_params=model_params,
         log_scale_params=log_scale_params,
-    )
 
-    train_list_path, val_list_path = training_val_split(
-        fits_dir,
-        output_dir="Parameters/",
-        job_id=job_id
     )
+    print(f"Creating subset and train/test split with seed {seed}...")
+    # --- SUBSET LOGIC ---
+    if data_subset_fraction < 1.0:
+        print(f"Selecting a {data_subset_fraction * 100:.0f}% random subset of the data.")
+        
+        # Determine the number of samples to keep
+        num_samples_to_keep = int(len(dataset) * data_subset_fraction)
+        
+        # Generate random indices to keep
+        indices_to_keep = np.random.choice(len(dataset), num_samples_to_keep, replace=False)
 
-    # If using a file list, load it
-    train_files, val_files = load_file_list(train_list_path), load_file_list(val_list_path)
+        # Create a Subset object, which wraps the original dataset
+        # This is the new 'full' dataset for the rest of the function
+        dataset = torch.utils.data.Subset(dataset, indices_to_keep)
+        
+        print(f"New dataset size after subset selection: {len(dataset)}")
+    # --- END: SUBSET LOGIC ---
 
     # Split
     dataset_size = len(dataset)
@@ -411,26 +497,23 @@ def create_dataloaders(
     train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
 
     # Optionally load scaling params
+    original_dataset_ref = dataset.dataset if isinstance(dataset, torch.utils.data.Subset) else dataset
+    
     if scaling_params_path and os.path.exists(scaling_params_path):
         print(f"Loading scaling parameters from: {scaling_params_path}")
         scaling = torch.load(scaling_params_path)
-        dataset.set_scaling_params(scaling['means'], scaling['stds'])
+        original_dataset_ref.set_scaling_params(scaling['means'], scaling['stds'])
     else:
-        # Compute scaling parameters if not provided
+         # Compute scaling parameters if not provided
         print("Calculating scaling parameters...")
         # Extract training indices (required for scaling)
         train_indices = train_dataset.indices if hasattr(train_dataset, 'indices') else list(range(train_size))
-
-        # Compute scaling parameters
         means, stds = calculate_label_scaling(dataset, train_indices)
+        original_dataset_ref.set_scaling_params(means, stds)
 
-        # Set scaling inside the dataset
-        dataset.set_scaling_params(means, stds)
-        print("Parameter means:", means, "stds:", stds)
         # Print scaling parameters with param name
         print("Scaling parameters (means and stds):")
-        
-        for i, param in enumerate(dataset.model_params):
+        for i, param in enumerate(original_dataset_ref.model_params):
             print(f"{param}: mean = {means[i]:.4f}, std = {stds[i]:.4f}")
 
         # Save scaling parameters
@@ -461,8 +544,10 @@ def create_dataloaders(
         pin_memory=True,
         persistent_workers=True
     )
+    
 
-    return train_loader, test_loader, dataset
+    return train_loader, test_loader, original_dataset_ref
+
 
 
 
