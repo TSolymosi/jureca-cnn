@@ -323,7 +323,7 @@ class FitsDataset(data.Dataset):
             if np.isnan(data).any():
                 nan_indices = np.argwhere(np.isnan(data))  # array of [d, h, w]
                 
-                log_file = "/p/scratch/westai0043/CNN/25.06.25/NanFits/runtime_nan_log.txt"
+                log_file = "/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN/NanFits/runtime_nan_log.txt"
                 with open(log_file, "a") as log:
                     log.write(f"\n[NaN Repair] File: {fits_path}, Shape: {data.shape}, NaN count: {len(nan_indices)}\n")
                     #for (d, h, w) in nan_indices:

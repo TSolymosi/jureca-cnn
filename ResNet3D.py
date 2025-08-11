@@ -10,19 +10,19 @@ from torch.profiler import profile, record_function, schedule, tensorboard_trace
 torch.backends.cudnn.benchmark = True
 
 import sys
-sys.path.insert(0, "/p/project/pasta/jusuf-radmc/jureca-cnn/")
-
+sys.path.insert(0, "/p/project/pasta/danowski1/Jureca_CNN/timons_branch/")
 
 #from sklearn.metrics import mean_absolute_error
-from cnn_dataloader import create_dataloaders
-import cnn_dataloader
-print(">>> Using dataloader from:", cnn_dataloader.__file__)
+from dataloader import create_dataloaders
+import dataloader
+print(">>> Using dataloader from:", dataloader.__file__)
 
 import os
 import time
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as stats
+import scipy.optimize as opt
 import pandas as pd
 
 # Override the default print function to flush the output immediately
@@ -60,12 +60,6 @@ def get_num_groups(num_channels):
         if num_channels % g == 0:
             return g
     return 1
-
-
-
-
-    
-
 
 # Helper classes as building blocks for 2D ResNet:
 # --- MDN Output Head ---
@@ -155,11 +149,11 @@ class Bottleneck2D(nn.Module):
         out = self.bn1(out)
         out = self.relu(out)
 
-        out = self.conv2(x)
+        out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
 
-        out = self.conv3(x)
+        out = self.conv3(out)
         out = self.bn3(out)
 
         if self.downsample is not None:
@@ -170,9 +164,7 @@ class Bottleneck2D(nn.Module):
         return out
 
 
-
 # 2D ResNet for Spectral Data
-
 class Spectral2DResNet(nn.Module):
     def __init__(self,
                  block_2d, spatial_layers_config, block_inplanes_spectral=64,
@@ -291,6 +283,8 @@ class Spectral2DResNet(nn.Module):
         if not torch.isfinite(x).all():
             raise ValueError("NaNs in input to forward()")
 
+        residual = x
+
         # Spectral convolutions
         x = self.spectral_conv_s1(x)
         if not torch.isfinite(x).all():
@@ -304,6 +298,14 @@ class Spectral2DResNet(nn.Module):
         if not torch.isfinite(x).all():
             raise ValueError("NaNs after spectral_conv_s3")
 
+        if residual.shape != x.shape:
+            residual = F.interpolate(residual, size=x.shape[2:], mode="trilinear", align_corners=False)
+            if residual.shape != x.shape:
+                ch_diff = x.shape[1] - residual.shape[1]
+                residual = F.pad(residual, (0,0,0,0,0,0,0,ch_diff))  # Pad channels
+        
+        x = x + residual
+        
         # Reshape for 2D
         N, C_spec, D_red, H, W = x.shape
         x = x.view(N, C_spec * D_red, H, W)
@@ -360,18 +362,40 @@ class Spectral2DResNet(nn.Module):
     
 
 # --- Gaussian NLL Loss Wrapper ---
-def gaussian_nll_loss_dict(output_dict, target_tensor):
+def gaussian_nll_loss_dict(output_dict, target_tensor, std_weights=None):
     losses = []
+    sigma_reg = True # Optional: Sigma regularization flag
+    reg_term = 0.0
+    sigma_reg_weights = {
+        "D" : 0.05,
+        "L" : 0.05,
+        "rr" : 0.05,
+        "ro" : 0.05,
+        "p" : 0.05,
+        "Tlow" : 0.05,
+        "plummer_shape" : 0.05,
+        "NCH3CN" : 0.05,
+    }
+
     for i, (param, out) in enumerate(output_dict.items()):
         mu = out['mu'].squeeze()
         sigma = out['sigma'].squeeze()
         y = target_tensor[:, i]
-        loss = F.gaussian_nll_loss(mu, y, sigma ** 2, full=True)
-        losses.append(loss)
-    return sum(losses) / len(losses)
+        base_loss = F.gaussian_nll_loss(mu, y, sigma ** 2, full=True)
 
+        # Normalize by inverse std^2 (if available)
+        if std_weights is not None:
+            base_loss = base_loss / (std_weights[i] ** 2 + 1e-6)
 
+        losses.append(base_loss)
 
+        # Sigma regularization (optional)
+        if sigma_reg:
+            weight = sigma_reg_weights.get(param, 0.0)  # Default weight is 0.0 if not specified
+            reg_term += weight * torch.mean(torch.log(sigma + 1e-6))  # Regularization term to encourage diversity in sigma
+    
+    total_loss = sum(losses)/len(losses) + reg_term if sigma_reg else sum(losses)/len(losses)
+    return total_loss
 
 
 S1_SpectralCNN_SpectralConv_like_head = True
@@ -572,7 +596,7 @@ def load_checkpoint(model, optimizer, scaler, device, checkpoint_dir="checkpoint
 
 #--- Evalution methods ---
 # --- Evaluation Enhancement: Residual vs Sigma Scatter + Coverage Ratio ---
-def plot_residual_vs_sigma(mu, sigma, y_true, param_names, job_id):
+def plot_residual_vs_sigma(mu, sigma, y_true, param_names, job_id, folder_name=None):
     residual = mu - y_true
     coverage_ratios = []
 
@@ -584,7 +608,10 @@ def plot_residual_vs_sigma(mu, sigma, y_true, param_names, job_id):
         plt.title(f'Residual vs σ: {name}')
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"ResNetPlots/{job_id}/Residual_vs_Sigma_{name}.png")
+        if folder_name is None:
+            plt.savefig(f"ResNetPlots/{job_id}/Residual_vs_Sigma_{name}.png")
+        else:
+            plt.savefig(f"{folder_name}/ResNetPlots/{job_id}/Residual_vs_Sigma_{name}.png")
         plt.close()
 
         within_1sigma = ((mu[:, i] > y_true[:, i] - sigma[:, i]) & (mu[:, i] < y_true[:, i] + sigma[:, i])).float().mean().item()
@@ -595,26 +622,76 @@ def plot_residual_vs_sigma(mu, sigma, y_true, param_names, job_id):
         print(f"  {name}: {ratio * 100:.2f}%")
 
 # --- Calibration Evaluation ---
-def evaluate_calibration(mu, sigma, y_true, param_names, job_id):
-    z_scores = (y_true - mu) / sigma
-    abs_z = torch.abs(z_scores)
-    levels = [1, 2, 3]
-    empirical = [(abs_z < lvl).float().mean(dim=0) for lvl in levels]
-    theoretical = [stats.norm.cdf(lvl) - stats.norm.cdf(-lvl) for lvl in levels]
+def evaluate_calibration(mu, sigma, y_true, param_names, job_id, epoch, folder_name = None):
+    """
+    Evaluates calibration, finds an optimal scaling factor `c` for each parameter's
+    uncertainty, and plots both the original and calibrated curves.
+    """
+    print("Evaluating and fitting calibration curves...")
+    # Theoretical fraction of data that should be within z sigma levels
+    levels = np.array([1, 2, 3])
+    theoretical_coverage = np.array([stats.norm.cdf(z) - stats.norm.cdf(-z) for z in levels])
 
-    plt.figure(figsize=(8, 6))
+    calibration_factors = {}
+    
+    plt.figure(figsize=(10, 8))
+    
+    # --- Objective Function for Optimization ---
+    def calibration_loss(c, sigma_param, y_true_param):
+        # Calculate empirical coverage with the calibrated sigma
+        abs_z_calibrated = torch.abs((y_true_param - mu_param) / (c * sigma_param))
+        empirical_coverage = np.array([(abs_z_calibrated < z).float().mean().item() for z in levels])
+        # Return the sum of squared errors
+        return np.sum((empirical_coverage - theoretical_coverage)**2)
+
+    # --- Find Optimal 'c' for Each Parameter ---
     for i, param in enumerate(param_names):
-        plt.plot(levels, [e[i].item() for e in empirical], marker='o', label=f'{param}')
-    plt.plot(levels, theoretical, 'k--', label='Expected (Gaussian)')
+        mu_param = mu[:, i]
+        sigma_param = sigma[:, i]
+        y_true_param = y_true[:, i]
+
+        # Use scipy's bounded scalar optimizer to find the best `c`
+        result = opt.minimize_scalar(
+            calibration_loss,
+            args=(sigma_param, y_true_param),
+            bounds=(0.01, 1.0), # Search for c in a reasonable range
+            method='bounded'
+        )
+        c_optimal = result.x
+        calibration_factors[param] = c_optimal
+
+        # --- Plotting ---
+        # Calculate original empirical coverage
+        abs_z_original = torch.abs((y_true_param - mu_param) / sigma_param)
+        original_empirical = [(abs_z_original < z).float().mean().item() for z in levels]
+
+        # Calculate calibrated empirical coverage
+        abs_z_calibrated = torch.abs((y_true_param - mu_param) / (c_optimal * sigma_param))
+        calibrated_empirical = [(abs_z_calibrated < z).float().mean().item() for z in levels]
+
+        # Plot the lines
+        p = plt.plot(levels, original_empirical, marker='o', ls=':', label=f'{param} (Original)')[0]
+        plt.plot(levels, calibrated_empirical, marker='x', ls='-', color=p.get_color(), label=f'{param} (Calibrated, c={c_optimal:.2f})')
+
+    plt.plot(levels, theoretical_coverage, 'k--', label='Expected (Gaussian)')
     plt.xlabel("Sigma Level")
     plt.ylabel("Fraction within Interval")
-    plt.title("Calibration Curve for All Parameters")
-    plt.legend()
+    plt.title(f"Epoch {epoch+1} - Calibration Curve (Original vs. Calibrated)")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f"ResNetPlots/{job_id}/Calibration_Curve_All_Params.png")
+    plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout to make room for legend
+    
+    # Save the plot
+    if folder_name is None:
+        cal_dir = f"ResNetPlots/{job_id}/Calibration/"
+    else:
+        cal_dir = f"{folder_name}/ResNetPlots/{job_id}/Calibration/"
+    os.makedirs(cal_dir, exist_ok=True)
+    plt.savefig(os.path.join(cal_dir, f"E{epoch+1}_Calibration_Curve.png"))
     plt.close()
-
+    
+    print("Calibration factors found:", {k: round(v, 3) for k, v in calibration_factors.items()})
+    return calibration_factors
 
 
 def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, enable_profiling=False, profile_steps=10):
@@ -642,7 +719,7 @@ def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, en
             nan_mask = ~torch.isfinite(data.view(data.shape[0], -1).sum(dim=1))
             bad_indices = nan_mask.nonzero(as_tuple=True)[0]
             
-            print(f"\n🛑 NaNs in input tensor at batch {batch_idx}, sample indices: {bad_indices.tolist()}")
+            print(f"\n NaNs in input tensor at batch {batch_idx}, sample indices: {bad_indices.tolist()}")
             print("Corresponding target parameter values for bad inputs:")
 
             for idx in bad_indices.tolist():
@@ -652,7 +729,6 @@ def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, en
             torch.save({"data": data.cpu(), "target": target.cpu()}, f"nan_input_batch{batch_idx}.pt")
             
             raise ValueError("NaN input encountered — likely due to bad parameter combination")
-
 
         if torch.isnan(data).any():
             print("NaN in input data")
@@ -669,9 +745,6 @@ def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, en
         # Debug input stats
         #print("Input stats: min =", data.min(), ", max =", data.max())
 
-        
-
-
         # Flag for noisy labels during training
         use_noisy_labels = False
         # Label noise injection if flag is True
@@ -685,14 +758,10 @@ def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, en
             noise = torch.zeros_like(target)
         labels_noisy = target + noise
 
-
-
         optimizer.zero_grad()
         with autocast(device_type=device.type):
             output = model(data)
-
-
-            # 🔍 Check for empty or invalid outputs BEFORE loss
+            # Check for empty or invalid outputs BEFORE loss
             if use_mdn is False:
                 if output.numel() == 0:
                     raise RuntimeError(f"Empty output tensor from model! Shape: {output.shape}")
@@ -715,12 +784,11 @@ def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, en
                     output_dict[param_name] = {'mu': mu, 'sigma': sigma} # Can use a dict or a tuple here
                 
                 # Now, pass the perfectly structured dictionary to your loss function
-                loss = gaussian_nll_loss_dict(output_dict, target)
+                loss = gaussian_nll_loss_dict(output_dict, target, std_weights=train_loader.dataset.dataset.dataset.scaler_stds)
             else:
                 # The non-MDN case
                 output = output # In this case, it's just a single tensor
                 loss = criterion(output, target)
-            
             
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -739,12 +807,13 @@ def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, en
     return running_loss / len(train_loader)
 
 
-
-def test(model, test_loader, criterion, device, epoch, use_mdn, original_dataset):
+def test(model, test_loader, criterion, device, epoch, use_mdn, original_dataset, calibration_factors, folder_name=None):
     model.eval()
     test_loss = 0.0 # Total loss across all batches
     all_preds, all_targets, all_sigmas = [], [], []
     loss_per_param = {param: [] for param in args.model_params}
+
+    print(f"scaler_stds: {test_loader.dataset.dataset.dataset.scaler_stds}")
 
     with torch.no_grad():
         for data, target in test_loader:
@@ -769,7 +838,7 @@ def test(model, test_loader, criterion, device, epoch, use_mdn, original_dataset
                     sigmas = torch.cat(sigma_list, dim=1)
                     
                     # Calculate the single, total loss value for this batch
-                    loss = gaussian_nll_loss_dict(output_dict, target)
+                    loss = gaussian_nll_loss_dict(output_dict, target, std_weights=test_loader.dataset.dataset.dataset.scaler_stds)
                 else:
                     # Standard case: output is already the predictions tensor
                     predictions = raw_output
@@ -821,12 +890,14 @@ def test(model, test_loader, criterion, device, epoch, use_mdn, original_dataset
     print("Mean Absolute Error (MAE) for each parameter in original scale:")
     for i, param_name in enumerate(args.model_params):
         print(f"  {param_name}: {mae[i]:.4e}")
-    
 
     print("Generating predicted vs. true plots...")
-
-    PNG_DIR = f"./Epoch_Plots/{args.job_id}/"
-    os.makedirs(PNG_DIR, exist_ok=True)
+    if folder_name is None:
+        PNG_DIR = f"./Epoch_Plots/{args.job_id}/"
+        os.makedirs(PNG_DIR, exist_ok=True)
+    else:
+        PNG_DIR = f"{folder_name}/Epoch_Plots/{args.job_id}/"
+        os.makedirs(PNG_DIR, exist_ok=True)
 
     # Convert tensors to numpy arrays
     all_outputs_original_np = outputs_original.numpy()
@@ -841,6 +912,9 @@ def test(model, test_loader, criterion, device, epoch, use_mdn, original_dataset
         y_pred = all_outputs_original_np[:, i]
         if use_mdn:
             y_err = all_sigmas_original_np[:, i]
+            # Get the calibation factor for this parameter, default to 1.0 if not calibrated
+            cal_factor = calibration_factors.get(current_param_name, 1.0)
+            y_err *= cal_factor  # Apply calibration factor to the uncertainty
 
         plt.figure(figsize=(7, 7))  # Square aspect ratio
 
@@ -892,19 +966,103 @@ def test(model, test_loader, criterion, device, epoch, use_mdn, original_dataset
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
         plt.tight_layout()
 
-        # Save
+        # Save plot
         plot_filename = os.path.join(PNG_DIR, f"E{epoch+1}_Test_{current_param_name}.png")
+        print("Saving plot:", plot_filename)
         plt.savefig(plot_filename, dpi=150)
         plt.close()
 
-    
 
-    
+        # --- DERIVED RADIUS PLOT ---
+        # Check if we have the necessary parameters to derive the radius
+        if use_mdn and "plummer_shape" in args.model_params and "p" in args.model_params and "rr" in args.model_params and current_param_name == "plummer_shape":
+            print("Generating derived radius plot...")
+            try:
+                # Get the indices of the required parameters
+                ps_idx = args.model_params.index("plummer_shape")
+                p_idx = args.model_params.index("p")
+                rr_idx = args.model_params.index("rr")
+
+                # --- 1. Get predictions and uncertainties from the original model outputs ---
+                # These are PyTorch tensors, which is what we want for calculations
+                y_pred = outputs_original[:, ps_idx]
+                sigma_y = sigmas_original[:, ps_idx]
+                
+                p_pred = outputs_original[:, p_idx]
+                sigma_p = sigmas_original[:, p_idx]
+
+                # Get the true radius for the x-axis
+                rr_true = targets_original[:, rr_idx]
+
+                # --- 2. Calculate the derived radius and its uncertainty ---
+                
+                # Avoid division by zero
+                # We use torch.where to handle p_pred being close to zero safely
+                log10_rr_derived = torch.where(torch.abs(p_pred) > 1e-9, y_pred / p_pred, torch.zeros_like(p_pred))
+                
+                # Propagate uncertainty for the division z = y / p
+                # (sigma_z / z)^2 = (sigma_y / y)^2 + (sigma_p / p)^2
+                # We need to handle cases where y or p might be zero
+                relative_err_y_sq = torch.where(torch.abs(y_pred) > 1e-9, (sigma_y / y_pred)**2, torch.zeros_like(y_pred))
+                relative_err_p_sq = torch.where(torch.abs(p_pred) > 1e-9, (sigma_p / p_pred)**2, torch.zeros_like(p_pred))
+                
+                sigma_log10_rr = torch.abs(log10_rr_derived) * torch.sqrt(relative_err_y_sq + relative_err_p_sq)
+                
+                # Final derived radius
+                rr_derived = torch.pow(10.0, log10_rr_derived)
+                
+                # Propagate uncertainty for the exponentiation rr = 10^z
+                # sigma_rr = |rr * ln(10)| * sigma_z
+                sigma_rr_derived = torch.abs(rr_derived * np.log(10)) * sigma_log10_rr
+
+                # --- 3. Create the plot ---
+                plt.figure(figsize=(7, 7))
+                #plt.xscale('log')
+                #plt.yscale('log')
+                plt.title(f"Epoch {epoch+1} - Derived radius (from plummer_shape & prho)")
+
+                # Convert to numpy for plotting
+                rr_true_np = rr_true.numpy()
+                rr_derived_np = rr_derived.numpy()
+                sigma_rr_derived_np = sigma_rr_derived.numpy()
+
+                # Filter for valid data points to plot
+                mask = (rr_true_np > 0) & (rr_derived_np > 0)
+                if np.any(mask):
+                    plt.errorbar(
+                        rr_true_np[mask], 
+                        rr_derived_np[mask], 
+                        yerr=sigma_rr_derived_np[mask], 
+                        fmt='o', alpha=0.3, markersize=4, capsize=2, label='Derived rr'
+                    )
+                    
+                    # Plot the y=x line
+                    minval = min(rr_true_np[mask].min(), rr_derived_np[mask].min())
+                    maxval = max(rr_true_np[mask].max(), rr_derived_np[mask].max())
+                    plt.plot([minval, maxval], [minval, maxval], 'r--', label='y = x')
+                    plt.xlim(minval, maxval)
+                    plt.ylim(minval, maxval)
+
+                plt.xlabel("True radius")
+                plt.ylabel("Derived radius")
+                plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+                plt.legend()
+                plt.tight_layout()
+
+                # Save the plot
+                plot_filename = os.path.join(PNG_DIR, f"E{epoch+1}_Test_Derived_radius.png")
+                plt.savefig(plot_filename, dpi=150)
+                plt.close()
+                
+                print("Derived radius plot saved successfully.")
+            
+            except Exception as e:
+                print(f"Could not generate derived radius plot. Error: {e}")
 
     return test_loss / len(test_loader), all_preds, all_targets, loss_per_param, all_sigmas
 
 
-def save_training_plots(train_losses, test_losses, loss_per_param_history, labels, job_id, epoch, max_epochs, update_interval=10):
+def save_training_plots(train_losses, test_losses, loss_per_param_history, labels, job_id, epoch, max_epochs, update_interval=10, folder_name=None):
     if (epoch + 1) % update_interval == 0 or (epoch + 1) == max_epochs:
         # Training and Validation loss
         plt.figure(figsize=(8, 5))
@@ -916,7 +1074,10 @@ def save_training_plots(train_losses, test_losses, loss_per_param_history, label
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"ResNetPlots/{job_id}/Train_vs_Validation_E{epoch+1}.png")
+        if folder_name is None:
+            plt.savefig(f"ResNetPlots/{job_id}/Train_vs_Validation_E{epoch+1}.png")
+        else:
+            plt.savefig(f"{folder_name}/ResNetPlots/{job_id}/Train_vs_Validation_E{epoch+1}.png")
         plt.close()
         print(f"Saved Train vs Validation loss plot for epoch {epoch+1}")
 
@@ -931,11 +1092,14 @@ def save_training_plots(train_losses, test_losses, loss_per_param_history, label
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"ResNetPlots/{job_id}/val_loss_per_param_E{epoch+1}.png")
+
+        if folder_name is None:
+            plt.savefig(f"ResNetPlots/{job_id}/val_loss_per_param_E{epoch+1}.png")
+        else:
+            plt.savefig(f"{folder_name}/ResNetPlots/{job_id}/val_loss_per_param_E{epoch+1}.png")
+
         plt.close()
         print(f"Saved per-parameter loss plot for epoch {epoch+1}")
-
-
 
 # for early stopping
 class EarlyStopping:
@@ -978,13 +1142,14 @@ if __name__ == "__main__":
     parser.add_argument("--use_attention_heads", type=bool, default=False, help="Use attention heads in the model")
     parser.add_argument("--use_mdn", type=bool, default=True, help="Use MDN output heads for uncertainty estimation")
     parser.add_argument("--data-subset-fraction", type=float, default=1.0, help="Fraction of the data to use for this run (e.g., 0.1 for 10%).")
+    parser.add_argument("--folder_name", type=str, default=None, help="Folder name for saving plots and checkpoints. If None, uses job_id.")
     args = parser.parse_args()
 
+    print(f"Saving plots and checkpoints in folder: {args.folder_name}")
     print(f"Creating Dataloaders with the following model parameters:")
     print(f"Model parameters: {args.model_params}")
     print(f"DEBUG: load_preprocessed = {args.load_preprocessed}")
 
-    
     train_loader, test_loader, dataset = create_dataloaders(
         fits_dir=args.data_dir,
         original_file_list_path=args.original_file_list,
@@ -999,6 +1164,7 @@ if __name__ == "__main__":
         log_scale_params = args.log_scale_params,
         data_subset_fraction=args.data_subset_fraction
     )
+    
     # Debugging: Check dataset type of trainloader
     print(f"DEBUG: Dataset class = {type(train_loader.dataset.dataset)}")
 
@@ -1124,12 +1290,16 @@ if __name__ == "__main__":
     checkpoint_interval = 5
 
     labels = args.model_params#, "NCH3CN", "incl", "phi"]
-    
+    # Global dictionary to store the latest calibration factors
+    CALIBRATION_FACTORS = {}    
     #early stopper
     #early_stopper = EarlyStopping(patience=50, min_delta=1e-8)
 
     # Create directory for plots
-    os.makedirs(f"ResNetPlots/{args.job_id}", exist_ok=True)
+    if args.folder_name is not None:
+        os.makedirs(f"{args.folder_name}/ResNetPlots/{args.job_id}", exist_ok=True)
+    else:
+        os.makedirs(f"ResNetPlots/{args.job_id}", exist_ok=True)
 
     # Load checkpoint if exists
     # `best_loss_at_last_checkpoint_save` stores the loss value OF THE CHECKPOINT CURRENTLY ON DISK
@@ -1142,7 +1312,7 @@ if __name__ == "__main__":
         start_time = time.time()
 
         train_loss = train(model, train_loader, optimizer, criterion, device, scaler, enable_profiling=False, use_mdn = use_mdn)
-        test_loss, preds, targets, loss_per_param, sigmas = test(model, test_loader, criterion, device, epoch, use_mdn=use_mdn, original_dataset=dataset)
+        test_loss, preds, targets, loss_per_param, sigmas = test(model, test_loader, criterion, device, epoch, use_mdn=use_mdn, original_dataset=dataset, calibration_factors=CALIBRATION_FACTORS, folder_name=args.folder_name)
         # Scheduler step based on validation loss in case of ReduceLROnPlateau
         scheduler.step(test_loss) if isinstance(scheduler, ReduceLROnPlateau) else  scheduler.step()
         
@@ -1176,8 +1346,40 @@ if __name__ == "__main__":
             job_id=args.job_id,
             epoch=epoch,
             max_epochs = max_epochs,
-            update_interval=5
+            update_interval=5,
+            folder_name=args.folder_name
         )
+
+        # Checkpointing logic
+        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == max_epochs:
+            # --- CALIBRATION LOGIC ---
+            if use_mdn:
+                # We need the latest predictions and targets to calculate calibration
+                # These are numpy arrays from the last test() call
+                latest_preds_scaled = preds
+                latest_sigmas_scaled = sigmas
+                latest_targets_scaled = targets
+
+                # Convert to original scale tensors
+                targets_orig = dataset.inverse_transform_labels(latest_targets_scaled)
+                preds_orig, sigmas_orig = dataset.inverse_transform_labels_with_uncertainty(latest_preds_scaled, latest_sigmas_scaled)
+                
+                # Calculate new calibration factors
+                new_factors = evaluate_calibration(preds_orig, sigmas_orig, targets_orig, args.model_params, args.job_id, epoch)
+                
+                # Update the global dictionary with the latest factors
+                CALIBRATION_FACTORS.update(new_factors)
+            # --- CALIBRATION LOGIC ---
+
+            # Your existing checkpointing logic
+            if test_loss < best_loss_at_last_checkpoint_save:
+                print(f"New best validation loss: {test_loss:.4f} (previous: {best_loss_at_last_checkpoint_save:.4f})")
+                save_checkpoint(epoch, model, optimizer, scaler, train_losses, test_losses, test_loss, checkpoint_save_dir)
+                print(f"Checkpoint saved at epoch {epoch+1}")
+                best_loss_at_last_checkpoint_save = test_loss
+            else:
+                print(f"No improvement in validation loss: {test_loss:.4f} (best: {best_loss_at_last_checkpoint_save:.4f})")
+                print(f"Checkpoint not saved at epoch {epoch+1}, continuing training...")
     
 
         # Save final results to CSV and run final evaluation at the end of training
@@ -1201,9 +1403,9 @@ if __name__ == "__main__":
                 print("Generating final evaluation plots...")
                 
                 # Call the new evaluation functions with the original-scale Tensors
-                plot_residual_vs_sigma(outputs_original, sigmas_original, targets_original, args.model_params, args.job_id)
-                evaluate_calibration(outputs_original, sigmas_original, targets_original, args.model_params, args.job_id)
-                
+                plot_residual_vs_sigma(outputs_original, sigmas_original, targets_original, args.model_params, args.job_id, folder_name=args.folder_name)
+                evaluate_calibration(outputs_original, sigmas_original, targets_original, args.model_params, args.job_id, epoch, folder_name=args.folder_name)
+
                 print("Final evaluation plots saved.")
                 # --- END: NEW EVALUATION CALLS ---
 
@@ -1234,6 +1436,6 @@ if __name__ == "__main__":
             df.to_csv(os.path.join(results_dir, "final_predictions.csv"), index=False)
             print(f"Saved final predictions to {os.path.join(results_dir, 'final_predictions.csv')}")
     # Save the final model checkpoint
-    save_checkpoint(num_epochs - 1, model, optimizer, scaler, train_losses, test_losses, test_loss, checkpoint_save_dir)
+    save_checkpoint(max_epochs-1, model, optimizer, scaler, train_losses, test_losses, test_loss, checkpoint_save_dir)
     
     
