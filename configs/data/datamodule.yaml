@@ -1,0 +1,16 @@
+_target_: src.data.fits_datamodule.FitsDataModule
+data_dir: ${data.data_dir}
+wavelength_stride: 1
+load_preprocessed: false
+preprocessed_dir: ${.data_dir}/preprocessed  
+use_local_nvme: false
+batch_size: 32
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+data_subset_fraction: 1.0
+model_params: ["D", "L", "rr", "ro", "p", "Tlow", "NCH3CN", "plummer_shape"]
+log_scale_params: ["D", "L", "NCH3CN"]
+scaling_params_path: /p/scratch/westai0043/CNN_timon/Hydra_Lightning/Parameters
+original_file_list_path: null

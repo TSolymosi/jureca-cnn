@@ -1,0 +1,27 @@
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  monitor: val_loss
+  mode: min
+  save_top_k: 1
+  save_last: true
+  filename: "epoch{epoch:02d}-valloss{val_loss:.2f}"
+
+early_stopping:
+  _target_: lightning.pytorch.callbacks.EarlyStopping
+  monitor: val_loss
+  patience: 50
+  mode: min
+
+prediction_scatter:
+  _target_: src.callbacks.prediction_plot_callback.PredictionPlotCallback
+  output_dir: ${outputs_dir}
+
+loss_curves:
+  _target_: src.callbacks.loss_curves.LossCurvesCallback
+  output_dir: ${outputs_dir}
+
+epoch_time_logger:
+  _target_: src.callbacks.epoch_time_logger.EpochTimeLogger
+
+#epoch_printer:
+#  _target_: src.callbacks.epoch_time_logger.EpochPrinter

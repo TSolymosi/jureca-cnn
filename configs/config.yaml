@@ -1,0 +1,12 @@
+defaults:
+  - _self_
+  - model: resnet
+  - data: datamodule
+  - trainer: default
+  - optim: adamw
+  - callbacks: default
+  
+
+# Optional top-level configs
+project_name: spectral-spatial-mdn
+outputs_dir: outputs/${folder_name}/${job_id}
