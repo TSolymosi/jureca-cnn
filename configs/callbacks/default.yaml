@@ -23,5 +23,5 @@ loss_curves:
 epoch_time_logger:
   _target_: src.callbacks.epoch_time_logger.EpochTimeLogger
 
-#epoch_printer:
-#  _target_: src.callbacks.epoch_time_logger.EpochPrinter
+CacheReset:
+  _target_: src.callbacks.prediction_plot_callback.CacheResetCallback

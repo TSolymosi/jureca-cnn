@@ -436,7 +436,7 @@ def calculate_label_scaling(full_dataset, indices):
 
     stacked = torch.stack(labels)
     means = stacked.mean(dim=0)
-    stds  = stacked.std(dim=0, unbiased=False).clamp_min(1e-12)
+    stds  = stacked.std(dim=0, unbiased=True).clamp_min(1e-12)
     return means, stds
 
 
@@ -486,7 +486,7 @@ def create_dataloaders(
                  compute scaling on train set, save artifacts. Returns None.
       - load:    all ranks. Load artifacts, build datasets/dataloaders, return them.
     """
-
+    
     os.makedirs(os.path.dirname(scaling_params_path), exist_ok=True)
     assert scaling_params_path is not None, "scaling_params_path must be provided"
     _ensure_dir(scaling_params_path)

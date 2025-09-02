@@ -4,7 +4,7 @@ wavelength_stride: 1
 load_preprocessed: false
 preprocessed_dir: ${.data_dir}/preprocessed  
 use_local_nvme: false
-batch_size: 32
+batch_size: 4 # batch size per gpu so 16 in total when using ddp
 num_workers: 8
 pin_memory: true
 persistent_workers: true

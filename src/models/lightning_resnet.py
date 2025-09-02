@@ -171,7 +171,6 @@ class LitResNetMDN(LightningModule):
 
     def _compute_loss(self, output, target, return_per_param: bool = False):
         """
-        Mirrors your script:
         - Non-MDN: MSE with strict shape/finite checks
         - MDN: per-parameter gaussian_nll (variance form), optional std_weights scaling
         """
@@ -191,29 +190,37 @@ class LitResNetMDN(LightningModule):
         # MDN path
         per_param = {}
         losses = []
+        reg_term = 0.0
+        sigma_reg = False
+        sigma_reg_weights = {
+            "D":0.05,"L":0.05,"rr":0.05,"ro":0.05,"p":0.05,"Tlow":0.05,"plummer_shape":0.05,"NCH3CN":0.05
+        }
 
         for i, name in enumerate(self.model_params):
-            mu    = output[i * 2].squeeze(-1)     # [B]
-            sigma = output[i * 2 + 1].squeeze(-1) # [B]
+            mu    = output[i*2].squeeze(-1)      # [B]
+            sigma = output[i*2+1].squeeze(-1)    # [B]
             if not self.sigma_head_outputs_positive:
                 sigma = F.softplus(sigma)
-            # sigma = sigma.clamp_min(self.sigma_floor)
+            # keep your stability floor consistent with the head’s +1e-6
+            sigma = torch.clamp(sigma, min=1e-6)
+
             var = sigma * sigma
-
             y_i = target[:, i]
-            # exact underlying function used in your test() per-param loop
-            li = F.gaussian_nll_loss(mu, y_i, var, full=True, reduction="none")  # [B]
 
-            # same inverse-variance weighting you applied via std_weights in dict loss
+            li = F.gaussian_nll_loss(mu, y_i, var, full=True, reduction="none")  # [B]
             if self.std_weights is not None:
-                # accept list/np/tensor
                 sw_i = float(self.std_weights[i])
                 li = li / (sw_i ** 2)
 
             per_param[name] = li.mean()
             losses.append(li)
 
-        loss = torch.stack(losses, dim=1).mean()  # mean over params and batch
+            if sigma_reg:
+                w = sigma_reg_weights.get(name, 0.0)
+                if w > 0:
+                    reg_term += w * torch.mean(torch.log(sigma + 1e-6))
+
+        loss = torch.stack(losses, dim=1).mean() + reg_term
         return (loss, per_param) if return_per_param else loss
 
     # --------------------- training / val / test ---------------------
@@ -233,6 +240,10 @@ class LitResNetMDN(LightningModule):
             raise RuntimeError(f"Output-target shape mismatch: {output.shape} vs {y.shape}")
 
         loss, per_param = self._compute_loss(output, y, return_per_param=True)
+        
+        if self.global_step == 0 and self.trainer.is_global_zero:
+            self.print(f"[DEBUG] first-batch train_loss: {loss.item():.6f}")
+
 
         # logging mirrors your keys
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)

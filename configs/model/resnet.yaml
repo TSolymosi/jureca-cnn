@@ -3,7 +3,7 @@ _target_: src.models.lightning_resnet.SpectralSpatialResNet
 # Model config
 config_name: "resnet18_2d_equivalent"
 model_depth: 18                # 10, 18, 34, ...
-use_batchnorm: true
+use_batchnorm: false # or sync_batchnorm: true
 use_attention_heads: false
 attention_latent_dim: 128
 use_mdn: true
