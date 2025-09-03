@@ -41,7 +41,7 @@ CPUS_FOR_PYTHON=8 # Match or be less than --cpus-per-task in the sleep job
 
 # ---Parameters to train---
 #D=3.054e+09_L=6.190e+04_ri=50_ro=1596_rr=205_p=1.18_np=100000_edr=1_rvar=0.33_phivar=1.4_LTE_Tlow=86.4_Thigh=800_NCH3CN=1.0e-10_vin=0.1_incl=130_phi=334_dist=3000_0.5arcsec
-MODEL_PARAMS="D L ro rr p Tlow NCH3CN" # Parameters to train on
+MODEL_PARAMS="D L ro rr p Tlow NCH3CN plummer_shape" # Parameters to train on  plummer_shape
 LOG_SCALE_PARAMS="D L NCH3CN" # Parameters to log scale during training
 
 # --- Define Paths ---
@@ -53,7 +53,7 @@ SCRIPT_NAME="ResNet3D.py"
 
 CURRENT_DIR="$(pwd)" # Current working directory
 SCRIPT_PATH="${CURRENT_DIR}/${SCRIPT_NAME}"
-VENV_PATH="/p/scratch/pasta/CNN/.cnn_venv/bin/activate" # Path to your venv activation script
+VENV_PATH="/p/project/pasta/jusuf-radmc/.radmc_venv_2024/bin/activate" # Path to your venv activation script
 SAVE_DIR="${CURRENT_DIR}/${TRAINING_JOB_ID}_model_checkpoints" # Where checkpoints are saved/loaded from
 
 # Log file for the Python script named after the job ID
@@ -68,7 +68,7 @@ LOG_FILE="slurm_output/cnn_run_${JOB_ID}.log"
 RESUME_CHECKPOINT_PATH=""
 
 # --- Define Modules to Load ---
-MODULES_TO_LOAD="Stages/2025 GCC PyTorch torchvision Python" # List necessary modules
+MODULES_TO_LOAD="Stages/2024 GCCcore/.12.3.0 Python/3.11.3" # List necessary modules
 
 
 # Append divider and timestamp to log
@@ -91,10 +91,21 @@ srun --jobid=${JOB_ID} --cpu-bind=none --ntasks=1 --cpus-per-task=${CPUS_FOR_PYT
 bash -c "
 echo '--- Inside srun subshell ---'
 
+module --force purge
+module load ${MODULES_TO_LOAD}
 echo 'Activating venv...'
 source \"${VENV_PATH}\" || { echo 'ERROR: Failed to activate venv inside srun'; exit 1; }
+unset PYTHONPATH PYTHONHOME
+hash -r
 echo 'Venv activated.'
 echo 'Running python: $(which python)' # Verify python path
+python -V      # 3.11.3
+
+# Before any Python import of matplotlib:
+export MPLBACKEND=Agg
+export MPLCONFIGDIR="${TMPDIR:-/p/scratch/westai0043}/mplcache_${SLURM_JOB_ID:-$$}"
+mkdir -p "$MPLCONFIGDIR"
+
 echo 'Job ID: ${JOB_ID}'
 echo 'Continuing training with job ID: ${TRAINING_JOB_ID}'
 echo 'Executing Python script: ${SCRIPT_PATH}'
@@ -103,18 +114,21 @@ python \"${SCRIPT_PATH}\" \\
     --wavelength-stride 1 \\
     --load-preprocessed False \\
     --use-local-nvme True \\
-    --batch-size 48 \\
-    --num-workers 6 \\
+    --batch-size 20 \\
+    --num-workers 8 \\
     --model-depth 18  \\
-    --num-epochs 50 \\
+    --num-epochs 20 \\
     --model_params ${MODEL_PARAMS} \\
     --log-scale-params ${LOG_SCALE_PARAMS} \\
     --job_id ${JOB_ID} \\
     --use_attention_heads False \\
+    --data-subset-fraction 0.8 \\
+    --add-noise-level 0.01 \\
+    --snr-threshold 5.0 \\
     ${TRAINING_JOB_ID:+--load_id "$TRAINING_JOB_ID"}
 echo 'Python script finished.'
 " 2>&1 | tee -a "${LOG_FILE}" # Capture output to log file
-#" > "slurm_output/cnn_run.log" 2>&1 # End of bash -c command string
+
 # Optional: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 
 # Capture the exit code of srun itself
 SRUN_EXIT_CODE=$?

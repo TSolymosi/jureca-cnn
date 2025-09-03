@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8  # Allocate enough CPUs for the eventual Python run
 #SBATCH --mem=128G         # Allocate enough memory
 #SBATCH --gres=gpu:4       # Allocate GPU
-#SBATCH --time=24:00:00    # Long enough for copy + debugging
+#SBATCH --time=14:00:00    # Long enough for copy + debugging
 
 echo "--- Loading Environment ---"
 VENV_PATH="/p/scratch/pasta/CNN/.venv/bin/activate"
@@ -25,7 +25,7 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 
 # --- Define Paths ---
-SRC="/p/scratch/pasta/production_run/Data_24.06.25_full_wo_randomness"
+SRC="/p/scratch/pasta/production_run/Data_21.07.25_models_new_var"
 LIST="$(realpath arcsec_files.txt)"
 #ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
 NODE_LOCAL_DIR="/local/nvme/${SLURM_JOB_ID}_fits_data"
