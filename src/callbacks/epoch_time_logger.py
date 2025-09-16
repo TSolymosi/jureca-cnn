@@ -14,7 +14,7 @@ class EpochTimeLogger(Callback):
     @rank_zero_only
     def on_train_epoch_end(self, trainer, pl_module):
         self._epoch_time = time.perf_counter() - self._t0
-        print(f"[Epoch {trainer.current_epoch}] time={self._epoch_time:.2f}s")
+        print(f"[Epoch {trainer.current_epoch}] time={self._epoch_time:.2f}s", flush=True)
 
     # if you want to print a metric, do it here instead (after val syncs)
     @rank_zero_only

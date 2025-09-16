@@ -6,7 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 from lightning.pytorch.callbacks import Callback
-from src.evaluation.calibration import evaluate_calibration
+#from src.evaluation.calibration import evaluate_calibration
 from pathlib import Path
 from lightning.pytorch.utilities import rank_zero_only
 
@@ -21,6 +21,9 @@ class PredictionPlotCallback(Callback):
 
     @rank_zero_only
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+            
         pl_module.eval()
 
         cache = getattr(pl_module, "_val_cache", {})
@@ -120,7 +123,7 @@ class PredictionPlotCallback(Callback):
             fname = os.path.join(Epoch_Plots, f"E{epoch+1}_Test_{param}.png")
             plt.savefig(fname, dpi=150)
             plt.close()
-            print("Saved plot:", fname)
+            print("Saved plot:", fname, flush=True)
 
         # Final artifacts once
         if (is_final_epoch or is_early_stop) and trainer.is_global_zero and not getattr(self, "_final_artifacts_done", False):
@@ -146,16 +149,16 @@ class PredictionPlotCallback(Callback):
             for name, ratio in coverage_ratios:
                 print(f"  {name}: {ratio * 100:.2f}%")
 
-            if sigmas_original is not None:
-                print("Evaluating calibration and plotting curves...")
-                _ = evaluate_calibration(
-                    mu=preds_original,
-                    sigma=sigmas_original,
-                    y_true=targets_original,
-                    param_names=self.model_params,
-                    epoch=epoch,
-                    folder_name=self.output_dir
-                )
+            # if sigmas_original is not None:
+            #     print("Evaluating calibration and plotting curves...")
+            #     _ = evaluate_calibration(
+            #         mu=preds_original,
+            #         sigma=sigmas_original,
+            #         y_true=targets_original,
+            #         param_names=self.model_params,
+            #         epoch=epoch,
+            #         folder_name=self.output_dir
+            #     )
 
             # CSV
             df = pd.DataFrame()
@@ -190,3 +193,4 @@ class CacheResetCallback(Callback):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        print("[CacheResetCallback] Cleared validation cache and freed memory.")

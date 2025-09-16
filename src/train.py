@@ -36,8 +36,15 @@ from src.data.fits_datamodule import FitsDataModule
 from src.callbacks.prediction_plot_callback import PredictionPlotCallback
 
 
+
+
+
 @hydra.main(config_path="../configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
+    from hydra.core.plugins import Plugins
+    from hydra.plugins.sweeper import Sweeper
+
+    print("Available sweepers:", Plugins.instance().discover(Sweeper), flush=True)
     # --- Reproducibility ---
     seed_everything(42, workers=True)
 
@@ -86,13 +93,24 @@ def main(cfg: DictConfig):
         num_sanity_val_steps=0,
     )
 
+    # --- right before calling trainer.fit(...) ---
+    ckpt_path = cfg.get("ckpt_path", None)        # path to a .ckpt file
+    mode      = cfg.get("mode", "train")          # "train" | "validate" | "test"
+
+    if mode == "train":
+        trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
+        trainer.validate(model, datamodule=datamodule)  # optional
+    elif mode == "validate":
+        trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt_path)
+    elif mode == "test":
+        trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
 
     # --- Fit ---
     trainer.fit(model, datamodule=datamodule)
 
     # Optional: test if defined
     trainer.validate(model, datamodule=datamodule)
-    return 0
+    return trainer.callback_metrics["val_loss"].item()
 
 if __name__ == "__main__":
     main()

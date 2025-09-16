@@ -7,6 +7,6 @@ use_batchnorm: false # or sync_batchnorm: true
 use_attention_heads: false
 attention_latent_dim: 128
 use_mdn: true
-target_params: ["D", "L", "rr", "ro", "p", "Tlow", "NCH3CN", "plummer_shape"]
+target_params: ["D", "L", "ro", "rr", "p", "Tlow", "NCH3CN", "plummer_shape"]
 sigma_head_outputs_positive: true
 sigma_floor: 1e-4

@@ -7,8 +7,7 @@ import torch.distributed as dist
 from typing import Optional, Dict, List, Tuple
 
 from ResNet3D import generate_2d_model  # keep your import
-# NOTE: your original gaussian_nll_loss_dict is not strictly required,
-# since we reproduce its math per-parameter below with std weighting.
+
 
 def _gather_cat_cpu(t) -> Optional[torch.Tensor]:
     if t is None:
@@ -36,16 +35,112 @@ def _gather_cat_cpu(t) -> Optional[torch.Tensor]:
     else:
         return obj
 
+
+# ----------------------- GPU-side noise/mask helpers -----------------------
+
+@torch.no_grad()
+def _rand_cauchy(shape, *, device, generator=None, dtype=torch.float32):
+    # Inverse-CDF: tan(pi*(U-0.5))
+    u = torch.rand(shape, device=device, generator=generator, dtype=dtype)
+    return torch.tan(torch.pi * (u - 0.5))
+
+@torch.no_grad()
+def _sample_truncated_folded_cauchy(mu: float, sigma: float, threshold: float,
+                                    shape, *, device, generator=None, max_iters: int = 10):
+    """
+    Samples |Cauchy(0,1)| scaled and shifted: mu + sigma * |Cauchy|
+    If threshold > 0, resamples values > threshold (up to max_iters).
+    Returns tensor of shape, dtype float32, device=device.
+    """
+    out = mu + sigma * torch.abs(_rand_cauchy(shape, device=device, generator=generator))
+    if threshold > 0:
+        mask = out > threshold
+        it = 0
+        while mask.any() and it < max_iters:
+            resample = mu + sigma * torch.abs(_rand_cauchy(mask.sum().item(),
+                                                           device=device, generator=generator))
+            out[mask] = resample
+            mask = out > threshold
+            it += 1
+    return out
+
+@torch.no_grad()
+def _apply_noise_and_mask_on_device(
+    x: torch.Tensor,
+    *,
+    gen: torch.Generator,
+    use_cauchy_gauss: bool = True,
+    cauchy_mu: float = 0.003,
+    cauchy_sigma: float = 0.0032,
+    cauchy_threshold: float = 0.07,
+    add_gauss_sigma: float = 0.0,
+    mask_frac: float = 0.0,
+    mask_mode: str = "sample",
+):
+    device = x.device
+
+    # ---- Noise ----
+    if use_cauchy_gauss:
+        # Per-sample RMS -> (B,1,1,1,...) broadcast
+        shape_rms = (x.shape[0],) + (1,) * (x.ndim - 1)
+        rms = _sample_truncated_folded_cauchy(
+            cauchy_mu, cauchy_sigma, cauchy_threshold,
+            shape_rms, device=device, generator=gen
+        ).to(torch.float32)
+
+        # NOTE: torch.randn_like(...) doesn't accept generator => use torch.randn(...)
+        noise = torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * rms
+        if add_gauss_sigma > 0.0:
+            noise = noise + torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)
+        x = x + noise.to(x.dtype)
+
+    elif add_gauss_sigma > 0.0:
+        x = x + (torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)).to(x.dtype)
+
+    # ---- Mask ----
+    if mask_frac > 0.0:
+        if mask_mode == "sample":
+            b = x.shape[0]
+            k = int(round(mask_frac * b))
+            if k > 0:
+                perm = torch.randperm(b, generator=gen, device=device)
+                drop_idx = perm[:k]
+                m = torch.ones((b,) + (1,) * (x.ndim - 1), device=device, dtype=x.dtype)
+                m[drop_idx] = 0
+                x = x * m
+        elif mask_mode == "element":
+            keep_prob = 1.0 - mask_frac
+            # NOTE: torch.rand_like(...) doesn't accept generator => use torch.rand(...)
+            m = (torch.rand(x.shape, device=device, generator=gen) < keep_prob).to(x.dtype)
+            x = x * m
+        else:
+            raise ValueError(f"Unknown mask_mode: {mask_mode}")
+
+    return x
+
+# --------------------------------------------------------------------------
+
+
 class LitResNetMDN(LightningModule):
     """
-    Ports the data checks + MDN/non-MDN loss behavior from your original train()/test()
-    into Lightning. DDP safe, AMP through Lightning. Plotting intentionally omitted.
+    Ports the data checks + MDN/non-MDN loss behavior into Lightning.
+    Adds fast GPU-side Cauchy-noise + masking (sample- or element-wise).
     """
-    def __init__(self, model_cfg, optim_cfg, training_cfg,
-                 std_weights=None,
-                 dump_bad_batch: bool = True,
-                 dump_dir: str = "./",
-                 ):
+    def __init__(
+        self, model_cfg, optim_cfg, training_cfg,
+        std_weights=None,
+        dump_bad_batch: bool = True,
+        dump_dir: str = "./",
+        # ---- New GPU-noise/masking controls (safe defaults) ----
+        apply_aug_train_only: bool = False,   # apply noise/mask during training only
+        use_cauchy_gauss: bool = True,       # replicate old CPU pipeline (Gaussian with Cauchy-drawn RMS)
+        cauchy_mu: float = 0.003,
+        cauchy_sigma: float = 0.0032,
+        cauchy_threshold: float = 0.07,
+        add_gauss_sigma: float = 0.0,        # extra plain Gaussian noise
+        mask_frac: float = 0.0,              # 0.6 => drop 60%
+        mask_mode: str = "sample",           # "sample" (drop files) or "element"
+    ):
         super().__init__()
         self.save_hyperparameters(logger=False)
 
@@ -65,12 +160,11 @@ class LitResNetMDN(LightningModule):
 
         # --------------------- Loss setup --------------------
         self.criterion = nn.MSELoss(reduction='mean') if not self.use_mdn else None
-        # If head outputs already-positive sigmas, keep True. Otherwise we softplus.
         self.sigma_head_outputs_positive = getattr(model_cfg, "sigma_head_outputs_positive", True)
         self.sigma_floor = getattr(model_cfg, "sigma_floor", 1e-4)
 
-        # Optional inverse-variance weighting (original used dataset scaler stds)
-        self.std_weights = std_weights  # can be tensor/np/list
+        # Optional inverse-variance weighting (unused in current NLL)
+        self.std_weights = std_weights
         self.dump_bad_batch = dump_bad_batch
         self.dump_dir = dump_dir
 
@@ -81,10 +175,20 @@ class LitResNetMDN(LightningModule):
         self._val_sigmas: Optional[List[torch.Tensor]] = [] if self.use_mdn else None
         self._val_cache: Dict[str, Optional[torch.Tensor]] = {}
 
+        # ---- Store augmentation config ----
+        self.apply_aug_train_only = apply_aug_train_only
+        self.aug_use_cauchy_gauss = use_cauchy_gauss
+        self.aug_cauchy_mu = cauchy_mu
+        self.aug_cauchy_sigma = cauchy_sigma
+        self.aug_cauchy_threshold = cauchy_threshold
+        self.aug_add_gauss_sigma = add_gauss_sigma
+        self.aug_mask_frac = mask_frac
+        self.aug_mask_mode = mask_mode  # "sample" or "element"
+
     # ------------------- Lightning lifecycle -------------------
 
     def on_fit_start(self):
-        # Mirror your on_fit_start, pull stds from the datamodule when available
+        # Pull stds from the datamodule when available
         if self.std_weights is None and self.trainer is not None:
             dm = self.trainer.datamodule
             if dm is not None and getattr(dm, "dataset_ref", None) is not None:
@@ -97,8 +201,30 @@ class LitResNetMDN(LightningModule):
                 if self.trainer.is_global_zero:
                     self.print(f"[on_fit_start] std_weights set from datamodule: {self.std_weights}")
 
+        if self.trainer.is_global_zero:
+            dm = self.trainer.datamodule
+            ds = getattr(dm, "dataset_ref", None)
+            model_params = list(self.model_params)
+            data_params  = list(getattr(dm, "model_params", []))  # from data_cfg
+            ds_params    = list(getattr(ds, "model_params", [])) if ds is not None else []
+
+            print("[CHECK] model_params:", model_params)
+            print("[CHECK] data_cfg.model_params:", data_params)
+            print("[CHECK] dataset.model_params:", ds_params)
+            assert model_params == data_params == ds_params, (
+                "Parameter order/name mismatch between model and datamodule/dataset! "
+                "This will misapply std_weights and corrupt per-param NLL."
+            )
+
+            means = getattr(ds, "scaler_means", None)
+            stds  = getattr(ds, "scaler_stds", None)
+            if means is not None and stds is not None:
+                for i, name in enumerate(model_params):
+                    print(f"[SCALE] {name}: mean={float(means[i]):.4g}, std={float(stds[i]):.4g}")
+
+            print(f"[INFO] Cauchy + Gaussian noise: use_cauchy_gauss={self.aug_use_cauchy_gauss}", flush=True)
+            
     def on_validation_epoch_start(self):
-        # keep a handle to original dataset for inverse transforms if needed later
         self._val_dataset = getattr(self.trainer.datamodule, "dataset_ref", None)
         self._val_preds = []
         self._val_targets = []
@@ -122,12 +248,9 @@ class LitResNetMDN(LightningModule):
 
     @staticmethod
     def _finite_mask_per_sample(x: torch.Tensor) -> torch.Tensor:
-        # like your: ~torch.isfinite(data.view(B,-1).sum(dim=1))
         return ~torch.isfinite(x.view(x.shape[0], -1).sum(dim=1))
 
     def _sanity_checks(self, x: torch.Tensor, y: torch.Tensor, batch_idx: int):
-        """Replicates your original defensive checks."""
-        # non-finite inputs
         if not torch.isfinite(x).all():
             nan_mask = self._finite_mask_per_sample(x)
             bad_indices = nan_mask.nonzero(as_tuple=True)[0]
@@ -145,7 +268,6 @@ class LitResNetMDN(LightningModule):
         if torch.isnan(x).any():
             raise ValueError("NaN in input")
 
-        # Spectral dim empty (keeps your exact check on dim=2)
         if x.shape[2] == 0:
             raise ValueError("Empty spectral dimension (D=0) in input")
 
@@ -153,29 +275,28 @@ class LitResNetMDN(LightningModule):
             raise ValueError("Target contains NaNs/Inf")
 
     def _split_mdn(self, output) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Split raw model output into lists of mu and sigma tensors (B,1 each)."""
         mu_list, sigma_list = [], []
         for i, _ in enumerate(self.model_params):
             mu    = output[i * 2]
             sigma = output[i * 2 + 1]
-            # make shapes uniform (B,1)
             mu    = mu.view(mu.shape[0], 1)
             sigma = sigma.view(sigma.shape[0], 1)
             if not self.sigma_head_outputs_positive:
                 sigma = F.softplus(sigma)
-            # optional stability floor (keep off by default like in your code)
-            # sigma = sigma.clamp_min(self.sigma_floor)
             mu_list.append(mu)
             sigma_list.append(sigma)
         return mu_list, sigma_list
 
+    def _split_batch(self, batch):
+        if isinstance(batch, (list, tuple)) and len(batch) == 3:
+            x, y, noise_rms = batch
+        else:
+            x, y = batch
+            noise_rms = None
+        return x, y, noise_rms
+
     def _compute_loss(self, output, target, return_per_param: bool = False):
-        """
-        - Non-MDN: MSE with strict shape/finite checks
-        - MDN: per-parameter gaussian_nll (variance form), optional std_weights scaling
-        """
         if not self.use_mdn:
-            # shape/finite checks (like your original before loss)
             if output.numel() == 0:
                 raise RuntimeError(f"Empty output tensor! Shape: {output.shape}")
             if target.numel() == 0:
@@ -187,85 +308,112 @@ class LitResNetMDN(LightningModule):
             loss = self.criterion(output, target)
             return (loss, {}) if return_per_param else loss
 
-        # MDN path
         per_param = {}
         losses = []
         reg_term = 0.0
         sigma_reg = False
         sigma_reg_weights = {
-            "D":0.05,"L":0.05,"rr":0.05,"ro":0.05,"p":0.05,"Tlow":0.05,"plummer_shape":0.05,"NCH3CN":0.05
+            "D": 0.05, "L": 0.05, "rr": 0.05, "ro": 0.05,
+            "p": 0.05, "Tlow": 0.05, "plummer_shape": 0.05, "NCH3CN": 0.05
         }
 
-        for i, name in enumerate(self.model_params):
-            mu    = output[i*2].squeeze(-1)      # [B]
-            sigma = output[i*2+1].squeeze(-1)    # [B]
-            if not self.sigma_head_outputs_positive:
-                sigma = F.softplus(sigma)
-            # keep your stability floor consistent with the head’s +1e-6
-            sigma = torch.clamp(sigma, min=1e-6)
-
-            var = sigma * sigma
-            y_i = target[:, i]
-
-            li = F.gaussian_nll_loss(mu, y_i, var, full=True, reduction="none")  # [B]
-            if self.std_weights is not None:
-                sw_i = float(self.std_weights[i])
-                li = li / (sw_i ** 2)
-
-            per_param[name] = li.mean()
-            losses.append(li)
-
-            if sigma_reg:
-                w = sigma_reg_weights.get(name, 0.0)
-                if w > 0:
-                    reg_term += w * torch.mean(torch.log(sigma + 1e-6))
-
-        loss = torch.stack(losses, dim=1).mean() + reg_term
+        import torch as _torch
+        with _torch.autocast(device_type="cuda", enabled=False):
+            for i, name in enumerate(self.model_params):
+                mu    = output[i*2].squeeze(-1).float()
+                sigma = output[i*2+1].squeeze(-1).float()
+                var = sigma.mul(sigma).add(1e-6)
+                y_i = target[:, i].float()
+                li = F.gaussian_nll_loss(mu, y_i, var, full=True, reduction="none")
+                per_param[name] = li.mean()
+                losses.append(li)
+                if sigma_reg:
+                    w = sigma_reg_weights.get(name, 0.0)
+                    if w > 0:
+                        reg_term += w * _torch.mean(_torch.log(var))
+        loss = _torch.stack(losses, dim=1).mean() + reg_term
         return (loss, per_param) if return_per_param else loss
 
     # --------------------- training / val / test ---------------------
 
+    def _maybe_augment_on_device(self, x: torch.Tensor) -> torch.Tensor:
+        if self.apply_aug_train_only and not self.training:
+            return x
+        # Per-rank, per-step generator (avoid identical noise across DDP ranks)
+        gen = torch.Generator(device=self.device)
+        seed = (
+            int(self.global_step) * 1000003
+            + int(self.current_epoch) * 9176
+            + int(getattr(self, "global_rank", 0))
+        )
+        gen.manual_seed(seed)
+        x = _apply_noise_and_mask_on_device(
+            x, gen=gen,
+            use_cauchy_gauss=self.aug_use_cauchy_gauss,
+            cauchy_mu=self.aug_cauchy_mu,
+            cauchy_sigma=self.aug_cauchy_sigma,
+            cauchy_threshold=self.aug_cauchy_threshold,
+            add_gauss_sigma=self.aug_add_gauss_sigma,
+            mask_frac=self.aug_mask_frac,
+            mask_mode=self.aug_mask_mode,
+        )
+        return x
+
     def training_step(self, batch, batch_idx):
-        x, y = batch
+        x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
-        # replicate your guard checks
+        # ---- Fast on-GPU noise + masking ----
+        x = self._maybe_augment_on_device(x)
+
         self._sanity_checks(x, y, batch_idx)
 
         output = self(x)
 
-        # Non-MDN: enforce shape parity like your script
         if not self.use_mdn and (output.shape != y.shape):
             raise RuntimeError(f"Output-target shape mismatch: {output.shape} vs {y.shape}")
 
         loss, per_param = self._compute_loss(output, y, return_per_param=True)
-        
-        if self.global_step == 0 and self.trainer.is_global_zero:
+
+        if batch_idx == 0 and self.trainer.is_global_zero and self.use_mdn:
             self.print(f"[DEBUG] first-batch train_loss: {loss.item():.6f}")
+            with torch.no_grad():
+                for i, name in enumerate(self.model_params):
+                    mu    = output[i*2].squeeze(-1)
+                    sigma = output[i*2+1].squeeze(-1)
+                    if not self.sigma_head_outputs_positive:
+                        sigma = F.softplus(sigma)
+                    sigma = torch.clamp(sigma, min=1e-6)
+                    y_i = y[:, i]
+                    nll_i = F.gaussian_nll_loss(mu.float(), y_i.float(), (sigma*sigma).float(),
+                                                full=True, reduction="none").mean()
+                    print(f"[Lightning][{name}] y(mean±std)={y_i.mean():.3g}±{y_i.std():.3g} "
+                          f"mu={mu.mean():.3g}±{mu.std():.3g} sigma={sigma.mean():.3g} "
+                          f"NLL={nll_i.item():.6f}")
 
-
-        # logging mirrors your keys
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         for k, v in per_param.items():
             self.log(f"train/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
+        x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
-        # keep checks in val too, to surface issues early
+        # No augmentation in val if apply_aug_train_only=True (default)
+        if not self.apply_aug_train_only:
+            x = self._maybe_augment_on_device(x)
+
         self._sanity_checks(x, y, batch_idx)
 
         output = self(x)
 
-        # cache preds/targets/sigmas on CPU (for later inverse transforms/plots)
         if self.use_mdn:
             mu_list, sigma_list = self._split_mdn(output)
-            preds  = torch.cat(mu_list, dim=1)     # [B, P]
-            sigmas = torch.cat(sigma_list, dim=1)  # [B, P]
+            preds  = torch.cat(mu_list, dim=1)
+            sigmas = torch.cat(sigma_list, dim=1)
         else:
             preds = output
             sigmas = None
@@ -282,17 +430,15 @@ class LitResNetMDN(LightningModule):
         return {"val_loss": loss}
 
     def test_step(self, batch, batch_idx):
-        x, y = batch
+        x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
-        # same checks as test() path
         self._sanity_checks(x, y, batch_idx)
 
         output = self(x)
         loss, per_param = self._compute_loss(output, y, return_per_param=True)
 
-        # For parity with your original "loss per param" reporting:
         for k, v in per_param.items():
             self.log(f"test/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
         self.log("test_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
@@ -312,7 +458,6 @@ class LitResNetMDN(LightningModule):
         else:
             self._val_cache = {}
 
-        # free buffers
         self._val_preds = []
         self._val_targets = []
         self._val_sigmas = None

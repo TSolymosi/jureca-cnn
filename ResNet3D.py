@@ -34,7 +34,15 @@ import pandas as pd
 import functools
 print = functools.partial(print, flush=True)
 
-
+def get_base_dataset(loader):
+    """
+    Drills down through Subset and RandomSplit wrappers to find the
+    underlying custom dataset object (e.g., FitsDataset).
+    """
+    dataset = loader.dataset
+    while hasattr(dataset, 'dataset'):
+        dataset = dataset.dataset
+    return dataset
 
 def get_inplanes():
     return [64, 128, 256, 512]
@@ -82,11 +90,12 @@ class MDNOutputHead2(nn.Module):
 class MDNOutputHead(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-        self.mu_head = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 4),
-            nn.ReLU(),
-            nn.Linear(input_dim // 4, 1)
-        )
+        # self.mu_head = nn.Sequential(
+        #     nn.Linear(input_dim, input_dim // 4),
+        #     nn.ReLU(),
+        #     nn.Linear(input_dim // 4, 1)
+        # )
+        self.mu_head = nn.Linear(input_dim, 1)
         
         # Give the sigma head more power
         self.sigma_head = nn.Sequential(
@@ -259,6 +268,40 @@ class Spectral2DResNet(nn.Module):
                         nn.Linear(fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32, 1))
 
         self._initialize_weights()
+    #     self._init_mdn_sigma_bias(default_sigma=1.0, per_param_sigma={"p": 2.0}) # Initialize MDN sigma bias
+
+    # import math
+    # from torch.nn.functional import softplus
+
+    # @staticmethod
+    # def _inv_softplus(y, eps=1e-12):F
+    #     # minimal stable inverse of softplus: y = log(1 + exp(x)) -> x = log(exp(y) - 1)
+    #     y = max(float(y), 1e-6)
+    #     return math.log(math.expm1(y) + eps)
+
+    # def _init_mdn_sigma_bias(self, default_sigma: float = 1.0, per_param_sigma: dict | None = None):
+    #     """
+    #     Initialize sigma-head biases so that softplus(linear + bias) + 1e-6 ≈ target_sigma.
+    #     You can widen only 'p' via per_param_sigma={"p": 2.0}.
+    #     """
+    #     per_param_sigma = per_param_sigma or {}
+    #     if hasattr(self, "output_heads"):
+    #         for pname, head in self.output_heads.items():
+    #             if hasattr(head, "sigma_head"):
+    #                 # find final Linear in the sigma_head Sequential
+    #                 last_linear = None
+    #                 for m in reversed(head.sigma_head):
+    #                     if isinstance(m, nn.Linear):
+    #                         last_linear = m
+    #                         break
+    #                 if last_linear is not None and last_linear.bias is not None:
+    #                     # desired sigma for this param
+    #                     target_sigma = float(per_param_sigma.get(pname, default_sigma))
+    #                     # your forward does: sigma = softplus(sigma_out) + 1e-6
+    #                     # so we invert softplus on (target_sigma - 1e-6)
+    #                     pre_sp = self._inv_softplus(max(target_sigma - 1e-6, 1e-6))
+    #                     last_linear.bias.data.fill_(pre_sp)
+    #                     print(f"[init] MDN σ-bias for '{pname}' set for ~{target_sigma}")
 
     def _make_spatial_layer_2d(self, block_2d, planes, num_blocks, stride, use_batchnorm):
         downsample = None
@@ -303,13 +346,13 @@ class Spectral2DResNet(nn.Module):
         if not torch.isfinite(x).all():
             raise ValueError("NaNs after spectral_conv_s3")
 
-        if residual.shape != x.shape:
-            residual = F.interpolate(residual, size=x.shape[2:], mode="trilinear", align_corners=False)
-            if residual.shape != x.shape:
-                ch_diff = x.shape[1] - residual.shape[1]
-                residual = F.pad(residual, (0,0,0,0,0,0,0,ch_diff))  # Pad channels
+        # if residual.shape != x.shape:
+        #     residual = F.interpolate(residual, size=x.shape[2:], mode="trilinear", align_corners=False)
+        #     if residual.shape != x.shape:
+        #         ch_diff = x.shape[1] - residual.shape[1]
+        #         residual = F.pad(residual, (0,0,0,0,0,0,0,ch_diff))  # Pad channels
         
-        x = x + residual
+        # x = x + residual
         
         # Reshape for 2D
         N, C_spec, D_red, H, W = x.shape
@@ -401,9 +444,9 @@ def gaussian_nll_loss_dict(output_dict, target_tensor, std_weights=None, sigma_f
         y = target_tensor[:, i]
         li = F.gaussian_nll_loss(mu, y, var, full=True, reduction="none")  # [B]
 
-        if std_weights is not None:
-            # normalize by inverse variance in label space
-            li = li / (float(std_weights[i]) ** 2)
+        #if std_weights is not None:
+        #    # normalize by inverse variance in label space
+        #    li = li / (float(std_weights[i]) ** 2)
 
         losses.append(li)
         per_param_mean[name] = li.mean()
@@ -711,6 +754,87 @@ def evaluate_calibration(mu, sigma, y_true, param_names, job_id, epoch, folder_n
     
     print("Calibration factors found:", {k: round(v, 3) for k, v in calibration_factors.items()})
     return calibration_factors
+
+# Plotting the first 10 average spectra from the train loader
+
+def plot_diagnostic_spectra(dataset, num_samples, job_id, freq_axis, output_dir):
+    """
+    Loads a few samples from the dataset, computes the spatially-averaged 
+    spectrum for EACH sample, and saves them as separate plots for visual inspection.
+    """
+    print(f"Generating {num_samples} diagnostic plots...")
+
+    # --- Step 1: Collect the first `num_samples` directly from dataset ---
+    collected_samples = []  # tuples of (cube, rms)
+    for idx in range(min(num_samples, len(dataset))):
+        x, _, rms = dataset[idx]   # access dataset directly (no sampler)
+        # x is typically [1, C, H, W] or [C, H, W]
+        if x.ndim == 4 and x.shape[0] == 1:
+            x = x.squeeze(0)
+        collected_samples.append((x, float(rms)))
+
+    if not collected_samples:
+        print("Could not retrieve any samples for diagnostic plot.")
+        return
+
+    # --- Step 2: Loop through each collected sample and create a plot ---
+    plot_dir = f"{output_dir}/Diagnostic_Plots/{job_id}/"
+    os.makedirs(plot_dir, exist_ok=True)
+
+    for i, (spectrum_cube, noise_rms) in enumerate(collected_samples):
+        # spectrum_cube has shape [channels, height, width]
+        height, width = spectrum_cube.shape[1], spectrum_cube.shape[2]
+
+        # Extract 1D spectrum from central pixel
+        spectrum_1d = spectrum_cube[:, height // 2, width // 2].cpu().numpy()
+
+        # --- SNR CALCULATION ---
+        snr_text = "SNR: N/A"
+        if noise_rms > 0 and freq_axis is not None:
+            C_KMS = 299792.458
+            FREQ_K3_GHZ = 220.7090170
+            VEL_WINDOW_KMS = 10
+            freq_window_ghz = FREQ_K3_GHZ * (VEL_WINDOW_KMS / C_KMS)
+            k3_freq_min, k3_freq_max = FREQ_K3_GHZ - freq_window_ghz, FREQ_K3_GHZ + freq_window_ghz
+            k3_mask = (freq_axis >= k3_freq_min) & (freq_axis <= k3_freq_max)
+            if np.any(k3_mask):
+                signal_peak = spectrum_cube[k3_mask, :, :].max().item()
+                snr = signal_peak / noise_rms
+                snr_text = f"SNR (Peak/RMS): {snr:.2f}\nRMS drawn: {noise_rms:.4f}"
+            else:
+                snr_text = "SNR: k=3 line not in range"
+
+        # --- Plotting ---
+        plt.figure(figsize=(12, 6))
+        x_axis = freq_axis if freq_axis is not None else np.arange(len(spectrum_1d))
+        xlabel = "Frequency (GHz)" if freq_axis is not None else "Channel Number"
+
+        plt.plot(x_axis, spectrum_1d)
+
+        if freq_axis is not None:
+            FREQ_REST_13CO_GHZ = 220.4039
+            VEL_WIDTH_KMS = 40
+            freq_width_ghz = FREQ_REST_13CO_GHZ * (VEL_WIDTH_KMS / C_KMS)
+            freq_min, freq_max = FREQ_REST_13CO_GHZ - freq_width_ghz, FREQ_REST_13CO_GHZ + freq_width_ghz
+            plt.axvspan(freq_min, freq_max, color='red', alpha=0.2, label='Masked ¹³CO Region')
+            plt.legend()
+
+        plt.text(0.02, 0.95, snr_text, transform=plt.gca().transAxes,
+                 fontsize=12, verticalalignment='top',
+                 bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5))
+
+        plt.title(f"Diagnostic Spectrum - Sample {i+1}")
+        plt.xlabel(xlabel)
+        plt.ylabel("Central Pixel Intensity")
+        plt.grid(True)
+        plt.tight_layout()
+
+        plot_filename = os.path.join(plot_dir, f"diagnostic_spectrum_sample_{i+1}.png")
+        plt.savefig(plot_filename)
+        plt.close()
+
+    print(f"{len(collected_samples)} diagnostic plots saved to {plot_dir}")
+
 
 
 def train(model, train_loader, optimizer, criterion, device, scaler, use_mdn, enable_profiling=False, profile_steps=10):
@@ -1162,6 +1286,13 @@ if __name__ == "__main__":
     parser.add_argument("--use_mdn", type=bool, default=True, help="Use MDN output heads for uncertainty estimation")
     parser.add_argument("--data-subset-fraction", type=float, default=1.0, help="Fraction of the data to use for this run (e.g., 0.1 for 10%).")
     parser.add_argument("--folder_name", type=str, default=None, help="Folder name for saving plots and checkpoints. If None, uses job_id.")
+    parser.add_argument("--add-noise-level", type=float, default=0.0, help="Absolute RMS of noise to add to spectra (e.g., 0.01 K).")
+    parser.add_argument("--snr-threshold", type=float, default=5.0, help="Minimum SNR required after adding noise.")
+    parser.add_argument("--mask-13co", type=lambda x: x.lower() == 'true', default=True, help="Mask the 13CO contaminated region.")
+    parser.add_argument("--use-cauchy-noise", type=lambda x: x.lower() == 'true', default=True, help="Enable variable noise augmentation using a Cauchy distribution.")
+    parser.add_argument("--cauchy-mu", type=float, default=0.003, help="Location parameter for Cauchy noise RMS in Jy/beam. Default corresponds to 0.3K.")
+    parser.add_argument("--cauchy-sigma", type=float, default=0.0032, help="Scale parameter for Cauchy noise RMS in Jy/beam. Default corresponds to 0.32K.")
+    parser.add_argument("--cauchy-threshold", type=float, default=0.07, help="Maximum allowed noise RMS in Jy/beam. Default corresponds to 7K.")
     args = parser.parse_args()
 
     print(f"Saving plots and checkpoints in folder: {args.folder_name}")
@@ -1181,7 +1312,14 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         model_params=args.model_params,
         log_scale_params = args.log_scale_params,
-        data_subset_fraction=args.data_subset_fraction
+        data_subset_fraction=args.data_subset_fraction,
+        use_cauchy_noise=args.use_cauchy_noise,
+        cauchy_mu=args.cauchy_mu,
+        cauchy_sigma=args.cauchy_sigma,
+        cauchy_threshold=args.cauchy_threshold,
+        add_noise_level=args.add_noise_level,
+        snr_threshold=args.snr_threshold,
+        mask_13co=args.mask_13co,
     )
     
     # Debugging: Check dataset type of trainloader
@@ -1190,6 +1328,13 @@ if __name__ == "__main__":
     # Output train/test dataset information
     print(f"Train dataset size: {len(train_loader.dataset)}")
     print(f"Test dataset size: {len(test_loader.dataset)}")
+
+    # Generate diagnostic plots for a few samples
+    print("Retrieving frequency axis for plotting...")
+    freq_axis = dataset.get_frequency_axis()
+
+    # Call the diagnostic function, passing the axis as an argument
+    #plot_diagnostic_spectra(train_loader, num_samples=10, job_id=args.job_id, freq_axis=freq_axis)
 
     # Create folder for plots
     os.makedirs(f"plots", exist_ok=True)

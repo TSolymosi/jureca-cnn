@@ -9,54 +9,51 @@ import shutil
 import time
 import glob
 import random
-
 from contextlib import suppress
 import torch.distributed as dist
-
-# Override the default print function to flush the output immediately
 import functools
+import json
+from typing import Literal
+from astropy.io import fits as _fits
+
+# Flush prints immediately
 print = functools.partial(print, flush=True)
 
-seed=42
-random.seed(seed)  # For reproducibility
+# Reproducibility
+seed = 42
+random.seed(seed)
 np.random.seed(seed)
 
 from lightning.pytorch.utilities import rank_zero_only
 
 @rank_zero_only
 def print_rank0(*args, **kwargs):
-    print(*args, **kwargs)
+    print(*args, **kwargs, flush=True)
 
-# Git version (test)
-
-# Helper function for Hydra setup
+# ------------------ Helpers ------------------ #
 def ddp_barrier():
     with suppress(Exception):
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-def normalize(data, method='minmax'):
-    """Normalize 3D data using specified method"""
-    if method == 'minmax':
-        data = np.nan_to_num(data)
-        lower = np.percentile(data, 1)
-        upper = np.percentile(data, 99)
-        return np.clip((data - lower) / (upper - lower + 1e-6), 0, 1)
-    elif method == 'zscore':
-        data = np.nan_to_num(data)
-        return (data - np.mean(data)) / (np.std(data) + 1e-6)
-    elif method == "root":
-        data = np.nan_to_num(data)
-        return np.cbrt(data)
-    elif method == "log":
-        data = np.nan_to_num(data)
-        return np.log10(data + 1e-6)
-    else:
-        raise ValueError(f"Unknown normalization method: {method}")
+# [REMOVED: not used anywhere now]
+# def normalize(data, method='minmax'):
+#     """Normalize 3D data using specified method"""
+#     data = np.nan_to_num(data)
+#     if method == 'minmax':
+#         lower, upper = np.percentile(data, [1, 99])
+#         return np.clip((data - lower) / (upper - lower + 1e-6), 0, 1)
+#     elif method == 'zscore':
+#         return (data - np.mean(data)) / (np.std(data) + 1e-6)
+#     elif method == "root":
+#         return np.cbrt(data)
+#     elif method == "log":
+#         return np.log10(data + 1e-6)
+#     else:
+#         raise ValueError(f"Unknown normalization method: {method}")
 
-
+# ------------------ Dataset ------------------ #
 class FitsDataset(data.Dataset):
-    #print("+++ FitsDataset class body executed +++")
     def __init__(
         self,
         fits_dir=None,
@@ -64,61 +61,63 @@ class FitsDataset(data.Dataset):
         wavelength_stride=1,
         use_local_nvme=True,
         load_preprocessed=False,
-        preprocessed_dir='/p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data',
+        preprocessed_dir='/p/scratch/pasta/CNN/Processed_Data/processed_data',
         model_params=["D", "L", "rr", "p"],
         log_scale_params=["D", "L"],
+        # ------------- CPU-SIDE NOISE/MASKING — DEPRECATED -------------
+        # use_cauchy_noise=False,
+        # cauchy_mu=0.003,
+        # cauchy_sigma=0.0032,
+        # cauchy_threshold=0.07,
+        # add_noise_level=0.0,
+        # snr_threshold=5.0,
+        # ---------------------------------------------------------------
+        mask_13co=True,
     ):
         self.wavelength_stride = wavelength_stride
         self.load_preprocessed = load_preprocessed
         self.file_list = file_list
-        print("=== FitsDataset constructor entered ===")
-        
-
-        self.scaler_means = None
-        self.scaler_stds = None
         self.model_params = model_params
         self.log_scale_params = log_scale_params
         self.param_indices_to_log = [self.model_params.index(p) for p in self.log_scale_params if p in self.model_params]
 
+        # [REMOVED: CPU-side noise/masking fields — handled on GPU now]
+        # self.use_cauchy_noise = use_cauchy_noise
+        # self.cauchy_mu = cauchy_mu
+        # self.cauchy_sigma = cauchy_sigma
+        # self.cauchy_threshold = cauchy_threshold
+        # self.add_noise_level = add_noise_level
+        # self.snr_threshold = snr_threshold
+
+        self.mask_13co = mask_13co
 
         if self.load_preprocessed:
-            # -------- Load from preprocessed .npy files --------
-            print(f"Loading preprocessed .npy data from: {preprocessed_dir}")
             self.data_dir = os.path.join(preprocessed_dir, "data_100")
             self.label_dir = os.path.join(preprocessed_dir, "labels_100")
-
             self.data_files = sorted(glob.glob(os.path.join(self.data_dir, "data_*.npy")))
             self.labels = np.load(os.path.join(self.label_dir, "labels.npy"))
-            self.label_min = np.load(os.path.join(self.label_dir, "label_min.npy"))
-            self.label_max = np.load(os.path.join(self.label_dir, "label_max.npy"))
-            self.resolved_file_list = list(getattr(self, "data_files", []))
-            assert len(self.data_files) == len(self.labels), "Mismatch in data and label count."
-
+            self.resolved_file_list = list(self.data_files)
         else:
-            # -------- Load from FITS files --------
             self.original_fits_dir = fits_dir
             self.use_local_nvme = use_local_nvme
 
-            # Copy to NVMe if requested
             if use_local_nvme and os.path.exists("/local/nvme"):
                 slurm_id = os.environ.get("SLURM_JOB_ID", "nojob")
-                #self.fits_dir = f"/local/nvme/{os.environ['USER']}/{slurm_id}"
                 self.fits_dir = f"/local/nvme/{slurm_id}_fits_data"
                 if not os.path.exists(self.fits_dir):
                     print_rank0(f"Copying FITS files to local storage: {self.fits_dir}")
                     os.makedirs(self.fits_dir, exist_ok=True)
-                    if dist.get_rank() == 0:
+                    if not dist.is_initialized() or dist.get_rank() == 0:
                         if file_list:
                             self._copy_selected_files(file_list)
                         else:
                             shutil.copytree(fits_dir, self.fits_dir, dirs_exist_ok=True)
-                    dist.barrier()
+                    ddp_barrier()
                 else:
                     print_rank0(f"Local NVMe path already exists: {self.fits_dir}")
             else:
                 self.fits_dir = fits_dir
 
-            # Find valid FITS files
             if file_list is not None:
                 self.fits_files = file_list
             else:
@@ -126,38 +125,28 @@ class FitsDataset(data.Dataset):
                 self.fits_files = [
                     os.path.join(root, f)
                     for root, _, files in os.walk(self.fits_dir)
-                    for f in files if f.endswith("arcsec.fits") and self._is_valid_fits(os.path.join(root, f))
+                    for f in files if f.endswith("arcsec.fits")
                 ]
                 print_rank0(f"Found {len(self.fits_files)} valid FITS files in {self.fits_dir}")
 
             if len(self.fits_files) == 0:
-                raise RuntimeError("ERROR: No valid FITS files found.")
+                raise RuntimeError("No FITS files found.")
 
-            self.resolved_file_list = list(getattr(self, "fits_files", []))
+            self.resolved_file_list = list(self.fits_files)
+            # Precompute 13CO mask if needed (deterministic; cheap)
+            self._chan_mask = None
+            if self.mask_13co and not self.load_preprocessed:
+                hdr = _fits.getheader(self.resolved_file_list[0], memmap=True)
+                n_ch = int(hdr['NAXIS3']); crval, cdelt, crpix = hdr['CRVAL3'], hdr['CDELT3'], hdr['CRPIX3']
+                idx = np.arange(0, n_ch, self.wavelength_stride, dtype=np.float64)
+                freq = crval + (idx - (crpix - 1.0)) * cdelt
+
+                FREQ_13CO_HZ, C_MS, vel_ms = 220.4039006e9, 299_792_458.0, 40_000.0
+                half_w = FREQ_13CO_HZ * (vel_ms / C_MS)
+                self._chan_mask = (freq >= FREQ_13CO_HZ - half_w) & (freq <= FREQ_13CO_HZ + half_w)
 
             print_rank0("Extracting labels from FITS filenames...")
-            self.labels = [self.extract_label(os.path.basename(f)) for f in self.fits_files]
-            self.labels = np.array(self.labels)
-            #self.label_min = self.labels.min(axis=0)
-            #self.label_max = self.labels.max(axis=0)
-            
-        
-            os.makedirs("Parameters", exist_ok=True)
-            #np.save("Parameters/label_min.npy", self.label_min)
-            #np.save("Parameters/label_max.npy", self.label_max)
-
-    def _is_valid_fits(self, file_path):
-        #try:
-        #    with fits.open(file_path, memmap=True) as hdul:
-        #        return hdul[0].data is not None
-        #except Exception:
-        #    return False
-        return True
-        
-    def set_scaling_params(self, means, stds):
-        self.scaler_means = means
-        self.scaler_stds = stds
-
+            self.labels = np.array([self.extract_label(os.path.basename(f)) for f in self.fits_files])
 
     def _copy_selected_files(self, file_list):
         for src_path in file_list:
@@ -169,97 +158,36 @@ class FitsDataset(data.Dataset):
     def extract_label(self, filename):
         pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
         matches = re.findall(pattern, filename)
-
-        label_dict = {}
-        for k, v in matches:
-            # Do not strip! Only normalize well-defined prefix
-            key = k
-            key = k.strip("_")  # remove any accidental leading underscores
-            if key.startswith("LTE_"):
-                key = key[len("LTE_"):]
-            label_dict[key] = float(v)
-
-        # DEBUG
-        #print(f"[extract_label] {filename}")
-        #print(f"  → Extracted: {label_dict}")
-        #print(f"  → Requested params: {self.model_params}")
-
+        label_dict = {k.strip("_").replace("LTE_", ""): float(v) for k, v in matches}
         label = []
-        if "incl" in self.model_params and "phi" in self.model_params:
-            if "plummer_shape" in self.model_params:
-                raise ValueError("Cannot use 'plummer_shape' with 'incl' and 'phi' parameters together. Choose one set.")
-            incl_rad = np.radians(label_dict["incl"])
-            phi_rad = np.radians(label_dict["phi"])
-            trig_map = {
-                "incl": [np.sin(incl_rad), np.cos(incl_rad)],
-                "phi":  [np.sin(phi_rad),  np.cos(phi_rad)],
-            }
-            for param in self.model_params:
-                if param in trig_map:
-                    label.extend(trig_map[param])
-                else:
-                    if param not in label_dict:
-                        raise KeyError(f"❌ Missing parameter '{param}' in filename:\n{filename}\nExtracted: {label_dict}")
-                    label.append(label_dict[param])
-        else:
-            for param in self.model_params:
-                if param == "plummer_shape":
-                    # This is our special derived parameter.
-                    # Get its components from the dictionary.
-                    p_val = label_dict.get('p')
-                    rr_val = label_dict.get('rr')
-
-                    # Check that the components were found in the filename.
-                    if p_val is None or rr_val is None:
-                        raise KeyError(f"To compute 'plummer_shape', both 'p' and 'rr' must be in the filename's labels. File: {filename}")
-
-                    # Perform a safety check for the log operation.
-                    if rr_val <= 0:
-                        raise ValueError(f"Cannot compute log of non-positive radius={rr_val} for 'plummer_shape'. File: {filename}")
-
-                    # Calculate the derived value and append it. We use log10 for consistency.
-                    derived_value = p_val * np.log10(rr_val)
-                    label.append(derived_value)
-                if param not in label_dict and param != "plummer_shape":
-                    raise KeyError(f"❌ Missing parameter '{param}' in filename:\n{filename}\nExtracted: {label_dict}")
-                if param != "plummer_shape":
-                    # Normal parameters
-                    label.append(label_dict[param])
-
+        for param in self.model_params:
+            if param == "plummer_shape":
+                p_val, rr_val = label_dict["p"], label_dict["rr"]
+                label.append(p_val * np.log10(rr_val))
+            else:
+                label.append(label_dict[param])
         return label
-    
 
+    def set_scaling_params(self, means, stds):
+        self.scaler_means, self.scaler_stds = means, stds
 
-
-    
     def inverse_transform_labels(self, scaled_labels):
         """
         Inverse transform standardized + log-scaled labels back to original physical units.
-
-        Args:
-            scaled_labels (torch.Tensor): Model outputs, shape (N,) or (B, N)
-
-        Returns:
-            torch.Tensor: Labels in original (physical) scale
         """
-
         if self.scaler_means is None or self.scaler_stds is None:
             print("[WARNING] inverse_transform_labels called without scaler parameters.")
             return scaled_labels
 
-        means = self.scaler_means
-        stds = self.scaler_stds
+        means, stds = self.scaler_means, self.scaler_stds
 
-        # Ensure input is tensor and on same device as means/stds
         if not isinstance(scaled_labels, torch.Tensor):
             scaled_labels = torch.tensor(scaled_labels)
         scaled_labels = scaled_labels.to(means.device)
 
-        # 1. Undo standardization
         unscaled = scaled_labels * stds + means
-
-        # 2. Undo log10 for specified parameters
         original = unscaled.clone()
+
         for idx in self.param_indices_to_log:
             if original.ndim == 1:
                 original[idx] = torch.pow(10.0, original[idx])
@@ -270,158 +198,134 @@ class FitsDataset(data.Dataset):
 
     def inverse_transform_labels_with_uncertainty(self, scaled_mu, scaled_sigma):
         """
-        Inverse transform predicted means and uncertainties from scaled space
-        back to original physical units.
-
-        Args:
-            scaled_mu (torch.Tensor): Scaled predicted means, shape (B, N)
-            scaled_sigma (torch.Tensor): Scaled predicted stddevs, shape (B, N)
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (mu_original, sigma_original)
+        Inverse transform predicted means and uncertainties back to original units.
         """
         if self.scaler_means is None or self.scaler_stds is None:
             print("[WARNING] inverse_transform_labels_with_uncertainty called without scaler parameters.")
             return scaled_mu, scaled_sigma
 
-        means = self.scaler_means
-        stds = self.scaler_stds
+        means, stds = self.scaler_means, self.scaler_stds
 
         if not isinstance(scaled_mu, torch.Tensor):
             scaled_mu = torch.from_numpy(scaled_mu)
         if not isinstance(scaled_sigma, torch.Tensor):
             scaled_sigma = torch.from_numpy(scaled_sigma)
 
-        scaled_mu = scaled_mu.to(means.device)
-        scaled_sigma = scaled_sigma.to(means.device)
+        scaled_mu, scaled_sigma = scaled_mu.to(means.device), scaled_sigma.to(means.device)
 
         unscaled_mu = scaled_mu * stds + means
         unscaled_sigma = scaled_sigma * stds
 
-        mu_orig = unscaled_mu.clone()
-        sigma_orig = unscaled_sigma.clone()
+        mu_orig, sigma_orig = unscaled_mu.clone(), unscaled_sigma.clone()
 
         for idx in self.param_indices_to_log:
-            mu_log = unscaled_mu[:, idx]
-            sigma_log = unscaled_sigma[:, idx]
-
-            # Convert mu ± sigma from log space to linear space
-            upper = torch.pow(10.0, mu_log + sigma_log)
-            lower = torch.pow(10.0, mu_log - sigma_log)
-
+            mu_log, sigma_log = unscaled_mu[:, idx], unscaled_sigma[:, idx]
+            upper, lower = torch.pow(10.0, mu_log + sigma_log), torch.pow(10.0, mu_log - sigma_log)
             mu_orig[:, idx] = torch.pow(10.0, mu_log)
             sigma_orig[:, idx] = (upper - lower) / 2.0
 
         return mu_orig, sigma_orig
 
+    def get_frequency_axis(self):
+        """
+        Computes and returns the frequency axis for the dataset.
+        Returns a numpy array of the frequency axis in GHz, or None if it cannot be determined.
+        """
+        if self.load_preprocessed or not hasattr(self, "fits_files") or not self.fits_files:
+            return None
 
+        try:
+            first_fits_path = self.fits_files[0]
+            with fits.open(first_fits_path, memmap=True) as hdul:
+                header = hdul[0].header
+
+            n_chans = header['NAXIS3']
+            crval = header['CRVAL3']
+            cdelt = header['CDELT3']
+            crpix = header['CRPIX3']
+
+            freq_axis_hz = crval + (np.arange(n_chans) - (crpix - 1)) * cdelt
+            if self.wavelength_stride > 1:
+                freq_axis_hz = freq_axis_hz[::self.wavelength_stride]
+            return freq_axis_hz / 1e9
+        except Exception as e:
+            print(f"[WARNING] Could not determine frequency axis. Error: {e}")
+            return None
 
     def __len__(self):
         return len(self.data_files if self.load_preprocessed else self.fits_files)
 
     def __getitem__(self, idx):
-        #print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] __getitem__ called with idx: {idx}")
-        try:
-            if self.load_preprocessed:
-                data = np.load(self.data_files[idx])
-                label = self.labels[idx]
-            else:
-                fits_path = self.fits_files[idx]
-                with fits.open(fits_path, memmap=True) as hdul:
-                    data = hdul[0].data
-                if data is None:
-                    raise ValueError(f"Data is None in FITS file: {fits_path}")
+        # print(f"[DEBUG] __getitem__ idx={idx}", flush=True)
+
+        if self.load_preprocessed:
+            data = np.load(self.data_files[idx])
+            label = self.labels[idx]
+            # fits_header = None
+        else:
+            fits_path = self.fits_files[idx]
+            # print(f"[DEBUG] Opening FITS: {fits_path}", flush=True)
+
+            with fits.open(fits_path, memmap=True) as hdul:
+                mm = hdul[0].data  # memmap
                 if self.wavelength_stride > 1:
-                    # Downsample data
-                    data = data[::self.wavelength_stride]
-                    
-                # Normalize data
-                #data = normalize(data, method="zscore")
-                label = self.labels[idx]
-            
-            # --- NaN check & repair ---
-            if np.isnan(data).any():
-                nan_indices = np.argwhere(np.isnan(data))  # array of [d, h, w]
-                
-                log_file = "/p/scratch/pasta/CNN/17.03.25/SpectralSpatial3DCNN/NanFits/runtime_nan_log.txt"
-                with open(log_file, "a") as log:
-                    log.write(f"\n[NaN Repair] File: {fits_path}, Shape: {data.shape}, NaN count: {len(nan_indices)}\n")
-                    #for (d, h, w) in nan_indices:
-                    #    log.write(f"   -> NaN at (channel={d}, y={h}, x={w})\n")
-                for d in range(data.shape[0]):
-                    slice_nan = np.isnan(data[d])
-                    if np.any(slice_nan):
-                        mean_val = np.nanmean(data[d])
-                        if np.isnan(mean_val):
-                            mean_val = 0.0  # or np.nanmin(data) or any safe default
-                            print(f"[WARN] Fully-NaN channel {d} in file {fits_path} — filled with {mean_val}")
-                        data[d][slice_nan] = mean_val
+                    data = np.array(mm[::self.wavelength_stride, :, :], dtype=np.float32, copy=True)
+                else:
+                    data = np.array(mm, dtype=np.float32, copy=True)
 
+            label = self.labels[idx]
+            # print(f"[DEBUG] Extracted label: {label}", flush=True)
 
-            # Normalize label
-            #label = (np.array(label) - self.label_min) / (self.label_max - self.label_min + 1e-8)
-            label_tensor = torch.tensor(label, dtype=torch.float32)
+        # [REMOVED: alternate frequency-axis path + NaN masking using freq_axis]
+        # if self.mask_13co and freq_axis_hz is not None:
+        #     ...
 
-            # Log scale certain parameters
-            for i in self.param_indices_to_log:
-                label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-12))
+        # Deterministic 13CO channel mask (cheap; keep)
+        if self.mask_13co and getattr(self, "_chan_mask", None) is not None:
+            data[self._chan_mask, :, :] = 0.0  # zero out masked channels; avoid NaNs
 
-            # Standardize using means and stds
-            if self.scaler_means is not None and self.scaler_stds is not None:
-                label_tensor = (label_tensor - self.scaler_means) / self.scaler_stds
-            else:
-                print("[WARNING] No scaling parameters provided. Using raw labels.")
+        # ---------------- CPU-SIDE NOISE — REMOVED ----------------
+        # rng = np.random
+        # noise_rms = 0.0
+        # if self.use_cauchy_noise:
+        #     rms = self.cauchy_mu + self.cauchy_sigma * np.abs(rng.standard_cauchy(size=1))
+        #     while rms > self.cauchy_threshold:
+        #         rms = self.cauchy_mu + self.cauchy_sigma * np.abs(rng.standard_cauchy(size=1))
+        #     noise_rms = float(rms)
+        #     data = data + rng.normal(0.0, noise_rms, size=data.shape).astype(np.float32)
+        # elif self.add_noise_level > 0.0:
+        #     noise_rms = float(self.add_noise_level)
+        #     data = data + rng.normal(0.0, noise_rms, size=data.shape).astype(np.float32)
+        # ----------------------------------------------------------
 
-            # Return as tensors
-            data = torch.tensor(data.astype(np.float32, copy=False), dtype=torch.float32).unsqueeze(0)
-        except Exception as e:
-            print(f"[ERROR] Failed on index {idx}, file: {self.file_list[idx]}")
-            raise e
-        return data, label_tensor
+        # NaN repair (keep: rare but helpful; vectorized and cheap)
+        repair_nans = True
+        if np.isnan(data).any() and repair_nans:
+            finite = np.isfinite(data)
+            count = finite.sum(axis=(1, 2), keepdims=True)
+            summ = np.where(finite, data, 0.0).sum(axis=(1, 2), keepdims=True)
+            means = np.divide(summ, count, out=np.zeros_like(summ), where=count > 0)
+            data[~finite] = np.broadcast_to(means, data.shape)[~finite]
 
-# def calculate_label_scaling(full_dataset, indices): # `full_dataset` could be a Subset
-#     labels = []
-    
-#     # Access the underlying dataset if we're dealing with a Subset
-#     #original_dataset = full_dataset.dataset if isinstance(full_dataset, torch.utils.data.Subset) else full_dataset
-#     # Map to original dataset + original indices
-#     if isinstance(full_dataset, torch.utils.data.Subset):
-#         subset = full_dataset
-#         original_dataset = subset.dataset
-#         subset_to_orig = subset.indices
-#         orig_indices = [subset_to_orig[i] for i in indices]   # <-- map!
-#     else:
-#         original_dataset = full_dataset
-#         orig_indices = indices
-    
-#     # Use the attributes from the original dataset
-#     param_indices_to_log = [original_dataset.model_params.index(p) for p in original_dataset.log_scale_params if p in original_dataset.model_params]
-    
-#     for idx in orig_indices:
-#         # Get the label from the original dataset's full label list
-#         label = original_dataset.labels[idx] 
-#         label_tensor = torch.tensor(label, dtype=torch.float32)
-#         for i in param_indices_to_log:
-#             label_tensor[i] = torch.log10(label_tensor[i].clamp(min=1e-11))
-#         labels.append(label_tensor)
+        # --- Labels ---
+        label_t = torch.as_tensor(label, dtype=torch.float32)
+        for i in self.param_indices_to_log:
+            label_t[i] = torch.log10(label_t[i].clamp(min=1e-12))
+        if hasattr(self, "scaler_means") and self.scaler_means is not None:
+            label_t = (label_t - self.scaler_means) / self.scaler_stds
 
-#     stacked = torch.stack(labels)
-#     means = stacked.mean(dim=0)
-#     stds = stacked.std(dim=0)
-#     stds[stds == 0] = 1.0
-#     return means, stds
+        x = torch.from_numpy(data.astype(np.float32, copy=False)).unsqueeze(0)
+        # [CHANGED RETURN]: (x, label_t) only; noise_rms removed
+        return x, label_t
 
+# ------------------ Scaling ------------------ #
 def calculate_label_scaling(full_dataset, indices):
     labels = []
-
-    # Map subset indices -> original indices
     if isinstance(full_dataset, torch.utils.data.Subset):
-        subset = full_dataset
-        original_dataset = subset.dataset
+        subset, original_dataset = full_dataset, full_dataset.dataset
         orig_indices = [subset.indices[i] for i in indices]
     else:
-        original_dataset = full_dataset
-        orig_indices = indices
+        original_dataset, orig_indices = full_dataset, indices
 
     param_indices_to_log = [original_dataset.model_params.index(p)
                             for p in original_dataset.log_scale_params
@@ -435,37 +339,20 @@ def calculate_label_scaling(full_dataset, indices):
         labels.append(t)
 
     stacked = torch.stack(labels)
-    means = stacked.mean(dim=0)
-    stds  = stacked.std(dim=0, unbiased=True).clamp_min(1e-12)
-    return means, stds
+    return stacked.mean(dim=0), stacked.std(dim=0, unbiased=True).clamp_min(1e-12)
 
-
-import os, json
-import torch
-import numpy as np
-from torch.utils.data import DataLoader
-from typing import Literal
-
-
-def _ensure_dir(path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
+# ------------------ Dataloaders ------------------ #
+def _ensure_dir(path): os.makedirs(os.path.dirname(path), exist_ok=True)
 def _derive_aux_paths(scaling_params_path: str):
-    """
-    Use the directory of scaling_params_path to store other prep artifacts.
-    """
     base_dir = os.path.dirname(scaling_params_path)
-    split_path = os.path.join(base_dir, "split_indices.pt")
-    subset_path = os.path.join(base_dir, "subset_indices.pt")
-    filelist_path = os.path.join(base_dir, "file_list.json")
-    return split_path, subset_path, filelist_path
-
-
+    return (os.path.join(base_dir, "split_indices.pt"),
+            os.path.join(base_dir, "subset_indices.pt"),
+            os.path.join(base_dir, "file_list.json"))
 
 def create_dataloaders(
     fits_dir,
     original_file_list_path=None,
-    scaling_params_path=None,  # REQUIRED for prep/load handoff
+    scaling_params_path=None,
     wavelength_stride=1,
     load_preprocessed=False,
     preprocessed_dir=None,
@@ -479,189 +366,191 @@ def create_dataloaders(
     data_subset_fraction=1.0,
     seed: int = 42,
     prep_mode: Literal["prepare","load"] = "load",
+    mask_13co: bool = True,
+    # ---------------- DEPRECATED (CPU) ----------------
+    # use_cauchy_noise: bool = True,
+    # cauchy_mu: float = 0.003,
+    # cauchy_sigma: float = 0.0032,
+    # cauchy_threshold: float = 0.07,
+    # add_noise_level: float = 0.0,
+    # snr_threshold: float = 5.0
+    # --------------------------------------------------
 ):
-    """
-    Two-phase behavior:
-      - prepare: rank-0 only. Scan files, make optional subset, deterministic split,
-                 compute scaling on train set, save artifacts. Returns None.
-      - load:    all ranks. Load artifacts, build datasets/dataloaders, return them.
-    """
-    
-    os.makedirs(os.path.dirname(scaling_params_path), exist_ok=True)
+    print("[DEBUG] Entering create_dataloaders", flush=True)
+
     assert scaling_params_path is not None, "scaling_params_path must be provided"
+
+    print("[DEBUG] scaling_params_path:", scaling_params_path, flush=True)
+
     _ensure_dir(scaling_params_path)
     split_path, subset_path, filelist_path = _derive_aux_paths(scaling_params_path)
+    print("[DEBUG] Derived aux paths:", split_path, subset_path, filelist_path, flush=True)
 
-    # ---------- Resolve input file list ----------
     file_list = None
-    if original_file_list_path and os.path.exists(original_file_list_path):
-        with open(original_file_list_path, "r") as f:
-            file_list = [line.strip() for line in f if line.strip()]
+    if filelist_path and os.path.exists(filelist_path):
+        with open(filelist_path, "r") as f:
+            file_list = json.load(f)
+        print(f"[DEBUG] Loaded existing file_list ({len(file_list)} files) from {filelist_path}", flush=True)
+    else:
+        if original_file_list_path and os.path.exists(original_file_list_path):
+            with open(original_file_list_path, "r") as f:
+                file_list = [line.strip() for line in f if line.strip()]
+            print(f"[DEBUG] Loaded file_list ({len(file_list)} files)", flush=True)
 
-    # ---------- PREPARE PHASE (rank 0 writes, all ranks wait) ----------
     if prep_mode == "prepare":
-        rank_zero = False
-        if dist.get_rank() == 0:
-            rank_zero = True
-        print_rank0("=== PREPARE: scanning/creating subset/split & computing scaling (once) ===")
+        print("[DEBUG] Prep mode = prepare", flush=True)
 
-        # Build a full dataset to discover files & labels
+        rank_zero = (not dist.is_initialized()) or (dist.get_rank() == 0)
+
         ds_full = FitsDataset(
-            fits_dir=fits_dir,
-            file_list=file_list,
+            fits_dir=fits_dir, file_list=file_list,
             wavelength_stride=wavelength_stride,
             use_local_nvme=use_local_nvme,
             load_preprocessed=load_preprocessed,
             preprocessed_dir=preprocessed_dir or fits_dir,
             model_params=list(model_params),
             log_scale_params=list(log_scale_params),
+            mask_13co=mask_13co,
+            # [REMOVED: pass-through of CPU noise args]
+            # use_cauchy_noise=use_cauchy_noise,
+            # cauchy_mu=cauchy_mu, cauchy_sigma=cauchy_sigma, cauchy_threshold=cauchy_threshold,
+            # add_noise_level=add_noise_level, snr_threshold=snr_threshold,
         )
+
         num_total = len(ds_full)
-        
-        print_rank0(f"[PREP] Found {num_total} samples")
-
         rng = np.random.default_rng(seed)
-        if data_subset_fraction < 1.0:
-            n_keep = int(num_total * data_subset_fraction)
-            subset_indices = np.sort(rng.choice(num_total, size=n_keep, replace=False))
-            
-            print_rank0(f"[PREP] Using subset: {n_keep}/{num_total} samples")
+
+        if os.path.exists(split_path) and os.path.exists(subset_path):
+            subset_indices = torch.load(subset_path)["subset_indices"]
+            split = torch.load(split_path)
+            train_idx, val_idx = split["train_indices"], split["val_indices"]
         else:
-            subset_indices = np.arange(num_total)
+            subset_indices = np.arange(num_total) if data_subset_fraction >= 1.0 \
+                else np.sort(rng.choice(num_total, int(num_total * data_subset_fraction), replace=False))
 
-        n_subset = len(subset_indices)
-        n_train = int(0.8 * n_subset)
-        perm = rng.permutation(n_subset)
-        train_idx = subset_indices[perm[:n_train]]
-        val_idx   = subset_indices[perm[n_train:]]
+            n_train = int(0.8 * len(subset_indices))
+            perm = rng.permutation(len(subset_indices))
+            train_idx, val_idx = subset_indices[perm[:n_train]], subset_indices[perm[n_train:]]
 
-        print("[PREP] Computing scaling on train split...")
+        # Compute scalers from *current* train split
         means, stds = calculate_label_scaling(ds_full, train_idx.tolist())
         ds_full.set_scaling_params(means, stds)
 
-        # --- rank-0 does all writes ---
         if rank_zero:
-            torch.save({"means": means, "stds": stds}, scaling_params_path)
+            scaling_dict = {"means": means, "stds": stds, "params": list(model_params)}
+            torch.save(scaling_dict, scaling_params_path)
             torch.save({"train_indices": train_idx, "val_indices": val_idx}, split_path)
             torch.save({"subset_indices": subset_indices}, subset_path)
-            to_write = file_list if file_list is not None else ds_full.resolved_file_list
             with open(filelist_path, "w") as f:
-                json.dump(to_write, f)
-            print_rank0(f"[PREP] Saved scaling → {scaling_params_path}")
-            print_rank0(f"[PREP] Saved split   → {split_path}")
-            print_rank0(f"[PREP] Saved subset  → {subset_path}")
-            print_rank0(f"[PREP] Saved file list → {filelist_path}")
-            return
+                json.dump(file_list or ds_full.resolved_file_list, f)
 
+        print("[DEBUG] Finished prepare branch", flush=True)
+        return
 
-    # ---------- LOAD PHASE (all ranks) ----------
-    # Read artifacts produced in prepare
+    # --------------------------
+    # LOAD branch
+    # --------------------------
+    print("[DEBUG] Prep mode = load", flush=True)
 
-    def _wait_for(path, tries=50, delay=0.1):
-        for _ in range(tries):
-            if os.path.exists(path):
-                return True
-            time.sleep(delay)
-        return os.path.exists(path)
+    rank_zero = (not dist.is_initialized()) or (dist.get_rank() == 0)
 
-    for p in (scaling_params_path, split_path, filelist_path):
-        _wait_for(p)
+    scaling = torch.load(scaling_params_path)
+    print("[DEBUG] Loaded scaling params", flush=True)
 
-    assert os.path.exists(scaling_params_path), f"Missing {scaling_params_path}. Run prep first."
-    assert os.path.exists(split_path), f"Missing split indices at {split_path}. Run prep first."
-    assert os.path.exists(filelist_path), f"Missing file list at {filelist_path}. Run prep first."
-
-    scaling = torch.load(scaling_params_path, weights_only=True)
     split = torch.load(split_path)
+    print("[DEBUG] Loaded split indices", flush=True)
 
     with open(filelist_path, "r") as f:
         file_list_loaded = json.load(f)
+    print(f"[DEBUG] Loaded {len(file_list_loaded)} file paths from json", flush=True)
 
-    # Rebuild the dataset with the EXACT same file order as in prepare
-    print("Creating dataset (LOAD)")
     ds_full = FitsDataset(
-        fits_dir=fits_dir,
-        file_list=file_list_loaded,
+        fits_dir=fits_dir, file_list=file_list_loaded,
         wavelength_stride=wavelength_stride,
         use_local_nvme=use_local_nvme,
         load_preprocessed=load_preprocessed,
         preprocessed_dir=preprocessed_dir or fits_dir,
         model_params=list(model_params),
         log_scale_params=list(log_scale_params),
+        mask_13co=mask_13co,
+        # [REMOVED: pass-through of CPU noise args]
+        # use_cauchy_noise=use_cauchy_noise,
+        # cauchy_mu=cauchy_mu, cauchy_sigma=cauchy_sigma, cauchy_threshold=cauchy_threshold,
+        # add_noise_level=add_noise_level, snr_threshold=snr_threshold,
     )
-    # Apply scaling
-    ds_full.set_scaling_params(scaling["means"], scaling["stds"])
+    print("[DEBUG] Constructed FitsDataset", flush=True)
 
-    # Wrap with Subset for the same subset as in prepare
-    subset_indices_obj = torch.load(subset_path)["subset_indices"]
-    # Then use the saved train/val split indices
-    train_idx = split["train_indices"]
-    val_idx   = split["val_indices"]
+    # --- PARAM-ORDER-AWARE SCALER LOADING ---
+    loaded_params = scaling.get("params", None)
+    current_params = list(model_params)
+    train_idx, val_idx = split["train_indices"], split["val_indices"]
 
-    # Map train/val into Subsets of ds_full
+    @rank_zero_only
+    def _print_scalers(tag, means_t, stds_t):
+        means_np = means_t.cpu().numpy()
+        stds_np = stds_t.cpu().numpy()
+        for i, p in enumerate(current_params):
+            print(f"[SCALE {tag}] {p}: mean={means_np[i]:.3f}, std={stds_np[i]:.4g}", flush=True)
+
+    if (loaded_params is None) or (loaded_params != current_params):
+        print("[WARN] Scaling params param-order mismatch or missing. Recomputing on current train split…", flush=True)
+        means, stds = calculate_label_scaling(ds_full, list(map(int, train_idx)))
+        ds_full.set_scaling_params(means, stds)
+        if rank_zero:
+            torch.save({"means": means, "stds": stds, "params": current_params}, scaling_params_path)
+        _print_scalers("RECOMP", means, stds)
+    else:
+        ds_full.set_scaling_params(scaling["means"], scaling["stds"])
+        _print_scalers("LOADED", scaling["means"], scaling["stds"])
+
+    # Sampler/shuffle parity
+    shuffle_train = (train_sampler is None)
     train_dataset = torch.utils.data.Subset(ds_full, train_idx)
     val_dataset   = torch.utils.data.Subset(ds_full, val_idx)
 
-    # Build loaders (note: persistent_workers only if workers > 0)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle_train,
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=1,
         drop_last=True
     )
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        shuffle=False, 
+        shuffle=False,
         sampler=test_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=1,
         drop_last=False
     )
 
-    # For callbacks needing a reference to the base dataset (for metadata, inverses, etc.)
-    dataset_ref = ds_full
-    return train_loader, val_loader, dataset_ref
+    print("[DEBUG] Finished create_dataloaders", flush=True)
+    return train_loader, val_loader, ds_full
 
-
+# ------------------ CLI ------------------ #
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
-    #parser.add_argument("--original-file-list", type=str, default=None)
-    parser.add_argument("--scaling-params-path", type=str, default=None)
-    parser.add_argument("--wavelength-stride", type=int, default=1)
-    parser.add_argument("--load-preprocessed", type=bool, default=False)
-    parser.add_argument("--preprocessed-dir", type=str, default=None)
+    parser.add_argument("--scaling-params-path", type=str, required=True)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num_workers", type=int, default=16)
-    parser.add_argument("--use-local-nvme", type=bool, default=False)
-    parser.add_argument('--job_id', type=str, default=None, help='Job ID for logging purposes.')
-    parser.add_argument('--model_params', type=str, nargs='+', default=["Dens", "Lum", "radius", "prho"], help='List of all model parameters to be trained.')
-    parser.add_argument('--log_scale_params', type=str, nargs='+', default=["Dens", "Lum"], help='List of parameters to be log-scaled.')
+    parser.add_argument("--num-workers", type=int, default=16)
     args = parser.parse_args()
 
-    train_loader, test_loader, dataset = create_dataloaders(
+    train_loader, val_loader, dataset = create_dataloaders(
         fits_dir=args.data_dir,
-        #original_file_list_path=args.original_file_list,
-        #scaling_params_path=args.scaling_params_path,
-        wavelength_stride=args.wavelength_stride,
-        load_preprocessed=args.load_preprocessed,
-        preprocessed_dir=args.preprocessed_dir,
-        use_local_nvme=args.use_local_nvme,
+        scaling_params_path=args.scaling_params_path,
         batch_size=args.batch_size,
-        model_params=args.model_params,
-        log_scale_params=args.log_scale_params,
+        num_workers=args.num_workers,
     )
-
     print(f"Dataset size: {len(dataset)}")
     for batch in train_loader:
         print("Sample batch:", batch[0].shape, batch[1].shape)

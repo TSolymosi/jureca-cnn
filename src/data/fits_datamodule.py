@@ -39,6 +39,14 @@ class FitsDataModule(LightningDataModule):
         self.log_scale_params     = data_cfg.log_scale_params
         self.data_subset_fraction = data_cfg.get("data_subset_fraction", 1.0)
         self.seed                 = data_cfg.get("seed", 42)
+        # Additional noise/masking parameters
+        self.mask_13co            = data_cfg.get("mask_13co", True)
+        self.use_cauchy_noise     = data_cfg.get("use_cauchy_noise", True)
+        self.cauchy_mu            = data_cfg.get("cauchy_mu", 0.003)
+        self.cauchy_sigma         = data_cfg.get("cauchy_sigma", 0.0032)
+        self.cauchy_threshold     = data_cfg.get("cauchy_threshold", 0.07)
+        self.add_noise_level      = data_cfg.get("add_noise_level", 0.0)
+        self.snr_threshold        = data_cfg.get("snr_threshold", 5.0)
 
     @rank_zero_only
     def prepare_data(self):
@@ -67,6 +75,13 @@ class FitsDataModule(LightningDataModule):
             data_subset_fraction=self.data_subset_fraction,
             seed=self.seed,
             prep_mode="prepare",
+            mask_13co=self.mask_13co,
+            # use_cauchy_noise=self.use_cauchy_noise,
+            # cauchy_mu=self.cauchy_mu,
+            # cauchy_sigma=self.cauchy_sigma,
+            # cauchy_threshold=self.cauchy_threshold,
+            # add_noise_level=self.add_noise_level,
+            # snr_threshold=self.snr_threshold,
         )
 
     def setup(self, stage=None):
@@ -92,6 +107,13 @@ class FitsDataModule(LightningDataModule):
             data_subset_fraction=self.data_subset_fraction,
             seed=self.seed,
             prep_mode="load",
+            mask_13co=self.mask_13co,
+            # use_cauchy_noise=self.use_cauchy_noise,
+            # cauchy_mu=self.cauchy_mu,
+            # cauchy_sigma=self.cauchy_sigma,
+            # cauchy_threshold=self.cauchy_threshold,
+            # add_noise_level=self.add_noise_level,
+            # snr_threshold=self.snr_threshold,
         )
         self._is_setup = True
 
@@ -101,6 +123,9 @@ class FitsDataModule(LightningDataModule):
 
     def val_dataloader(self):
         return self.val_loader
+
+    def test_dataloader(self):
+        return self.val_loader  # or a separate test loader if you have one
 
     # Optional: for callbacks needing inverse transforms / metadata
     def get_dataset_reference(self):

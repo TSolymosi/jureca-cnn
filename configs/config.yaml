@@ -5,8 +5,37 @@ defaults:
   - trainer: default
   - optim: adamw
   - callbacks: default
-  
+  # - scheduler: ReduceLROnPlateau
+  - override hydra/sweeper: optuna   # use plugin’s built-in Optuna sweeper
 
 # Optional top-level configs
 project_name: spectral-spatial-mdn
 outputs_dir: outputs/${folder_name}/${job_id}
+
+logger:
+  _target_: lightning.pytorch.loggers.TensorBoardLogger
+  save_dir: ${outputs_dir}
+  name: ${folder_name}
+  version: ${job_id}   # prevents "version_#"
+
+hydra:
+  run:
+    dir: ${outputs_dir}
+  sweep:
+    dir: multirun/${project_name}
+    subdir: ${hydra.job.num}
+
+  sweeper:
+    _target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
+    direction: minimize         # or "maximize", depending on your objective
+    n_trials: 10                # number of Optuna trials
+    n_jobs: 1                   # number of parallel jobs
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: 42                  # reproducibility
+  
+    params:
+      model.model_depth: choice(18, 34)
+      optim.lr: tag(log, interval(1e-5, 3e-3))
+      data.batch_size: choice(4, 8, 16)
+      data.num_workers: choice(2, 4, 8)
