@@ -10,3 +10,8 @@ use_mdn: true
 target_params: ["D", "L", "ro", "rr", "p", "Tlow", "NCH3CN", "plummer_shape"]
 sigma_head_outputs_positive: true
 sigma_floor: 1e-4
+covariance_type: "full"  # "full" or "diagonal"
+num_mixtures: 1         # For MDN
+cov_diag_use_log: true
+cov_diag_targets: {D: 1.0, rr: 1.0}
+cov_diag_weights: {D: 0.05, rr: 0.05}

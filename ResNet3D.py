@@ -75,41 +75,75 @@ def get_num_groups(num_channels):
     return 1
 
 # Helper classes as building blocks for 2D ResNet:
-# --- MDN Output Head ---
-class MDNOutputHead2(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.mu_layer = nn.Linear(input_dim, 1)
-        self.sigma_layer = nn.Linear(input_dim, 1)
-
-    def forward(self, x):
-        mu = self.mu_layer(x)
-        sigma = F.softplus(self.sigma_layer(x)) + 1e-6  # ensure positivity
-        return {'mu': mu, 'sigma': sigma}
-    
+# --- MDN Output Head ---  
 class MDNOutputHead(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, predict_sigma=True, num_components: int = 1, min_sigma: float = 1e-6):
         super().__init__()
-        # self.mu_head = nn.Sequential(
-        #     nn.Linear(input_dim, input_dim // 4),
-        #     nn.ReLU(),
-        #     nn.Linear(input_dim // 4, 1)
-        # )
-        self.mu_head = nn.Linear(input_dim, 1)
-        
-        # Give the sigma head more power
-        self.sigma_head = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 4),
-            nn.ReLU(),
-            nn.Linear(input_dim // 4, 1)
-        )
+        self.K = int(num_components)
+        self.min_sigma = float(min_sigma)
+        self.predict_sigma = predict_sigma
 
+        #mu ouztput head
+        self.mu_head = nn.Linear(input_dim, self.K)
+        # Give the sigma head more power
+        if self.predict_sigma:
+            self.sigma_head = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 4),
+                nn.ReLU(),
+                nn.Linear(input_dim // 4, self.K)
+            )
+        
     def forward(self, x):
-        mu = self.mu_head(x)
-        # Pass the features through the more complex sigma head
-        sigma_out = self.sigma_head(x)
-        sigma = F.softplus(sigma_out) + 1e-6
-        return {'mu': mu, 'sigma': sigma}
+        mu = self.mu_head(x)    # (B,K)
+        if self.predict_sigma:
+            # Pass the features through the more complex sigma head
+            sigma_out = self.sigma_head(x)
+            sigma = F.softplus(sigma_out) + self.min_sigma  # Ensure positivity (B,K)
+            return {'mu': mu, 'sigma': sigma}
+        return {'mu': mu}
+
+class CovarianceHead(nn.Module):
+    """
+    Predicts Cholesky L for full covariance Σ = L L^T.
+    Optionally returns sigma_diag = sqrt(diag(Σ)) for convenience.
+    When num_components>1, emits K Cholesky factors per item.
+    """
+    def __init__(self, input_dim: int, d: int, num_components: int = 1, jitter: float = 1e-6):
+        super().__init__()
+        self.d = d
+        self.K = int(num_components)
+        self.jitter = float(jitter)
+
+        packed = d * (d + 1) // 2
+        out_dim = packed if self.K == 1 else self.K * packed
+        self.L_params = nn.Linear(input_dim, out_dim)
+        self.softplus = nn.Softplus()
+
+    def forward(self, feats: torch.Tensor):
+        B, d, K = feats.size(0), self.d, self.K
+        lvec = self.L_params(feats)  # (B, P) or (B, K*P), P=d(d+1)/2
+        if K == 1:
+            L = feats.new_zeros(B, d, d)
+            i, j = torch.tril_indices(d, d, device=feats.device)
+            L[:, i, j] = lvec
+            # positive diag
+            diag = torch.diagonal(L, dim1=-2, dim2=-1)
+            diag.copy_(self.softplus(diag) + self.jitter)
+            sigma_diag = torch.sqrt((L.square()).sum(dim=-1))  # (B,d)
+            return {"L": torch.tril(L), "sigma_diag": sigma_diag}
+
+        # K > 1
+        P = d * (d + 1) // 2
+        lvec = lvec.view(B, K, P)
+        L = feats.new_zeros(B, K, d, d)
+        i, j = torch.tril_indices(d, d, device=feats.device)
+        L[:, :, i, j] = lvec
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        diag.copy_(self.softplus(diag) + self.jitter)
+        sigma_diag = torch.sqrt((L.square()).sum(dim=-1))  # (B,K,d)
+        return {"L": torch.tril(L), "sigma_diag": sigma_diag}
+
+
 
 # --- BasicBlock and Bottleneck for 2D ResNet ---
 class BasicBlock2D(nn.Module):
@@ -185,13 +219,16 @@ class Spectral2DResNet(nn.Module):
                  num_wavelengths_in=2000, initial_proj_channels=64, n_outputs=4,
                  dropout_prob=0.2, use_batchnorm=True, fc_hidden_dim=512,
                  target_params_list=None, simple_feature_head=True,
-                 use_attention_heads=False, attention_latent_dim=128, use_mdn = True):
+                 use_attention_heads=False, attention_latent_dim=128, use_mdn = True, covariance_type: str = "diagonal", num_mixtures: int = 1):
         super().__init__()
+        print(f"[DEBUG Spectral2DResNet] init with: covariance_type={covariance_type}, num_mixtures={num_mixtures}, use_mdn={use_mdn}")
         self.use_mdn = use_mdn
         self.use_batchnorm = use_batchnorm
         self.use_attention_heads = use_attention_heads
         self.attention_latent_dim = attention_latent_dim
-
+        self.covariance_type = covariance_type
+        self.num_mixtures = num_mixtures
+        
         # --- Spectral Convolution Part ---
         spectral_kernel_size1, spectral_stride1 = 11, 4; spec_padding1 = spectral_kernel_size1 // 2
         d_out1 = (num_wavelengths_in - spectral_kernel_size1 + 2 * spec_padding1) // spectral_stride1 + 1
@@ -251,57 +288,26 @@ class Spectral2DResNet(nn.Module):
                 param: nn.Linear(attention_latent_dim, 1) for param in target_params_list
             })
         else:
+            K = int(self.num_mixtures)
             # Simple feature heads
             self.output_heads = nn.ModuleDict()
+            predict_sigma = not (self.use_mdn and self.covariance_type == "full")
             for param_name in target_params_list:
-                if simple_feature_head:
-                    #self.output_heads[param_name] = nn.Linear(fc_hidden_dim, 1)
-                    if use_mdn:
-                        self.output_heads[param_name] = MDNOutputHead(fc_hidden_dim)
-                    else:
-                        self.output_heads[param_name] = nn.Linear(fc_hidden_dim, 1)
+                if use_mdn:
+                    self.output_heads[param_name] = MDNOutputHead(
+                        fc_hidden_dim, predict_sigma=predict_sigma, num_components=K
+                    )
                 else:
-                    
-                    self.output_heads[param_name] = nn.Sequential(
-                        nn.Linear(fc_hidden_dim, fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32),
-                        nn.ReLU(),
-                        nn.Linear(fc_hidden_dim // 2 if fc_hidden_dim // 2 >= 32 else 32, 1))
+                    self.output_heads[param_name] = nn.Linear(fc_hidden_dim, 1)
 
+            # Covariance head if needed
+            if self.use_mdn and self.covariance_type == "full":
+                self.cov_head = CovarianceHead(fc_hidden_dim, n_outputs, num_components=K)
+
+            # A single shared mixture head only when K>1
+            if self.use_mdn and K > 1:
+                self.pi_head = nn.Linear(fc_hidden_dim, K)
         self._initialize_weights()
-    #     self._init_mdn_sigma_bias(default_sigma=1.0, per_param_sigma={"p": 2.0}) # Initialize MDN sigma bias
-
-    # import math
-    # from torch.nn.functional import softplus
-
-    # @staticmethod
-    # def _inv_softplus(y, eps=1e-12):F
-    #     # minimal stable inverse of softplus: y = log(1 + exp(x)) -> x = log(exp(y) - 1)
-    #     y = max(float(y), 1e-6)
-    #     return math.log(math.expm1(y) + eps)
-
-    # def _init_mdn_sigma_bias(self, default_sigma: float = 1.0, per_param_sigma: dict | None = None):
-    #     """
-    #     Initialize sigma-head biases so that softplus(linear + bias) + 1e-6 ≈ target_sigma.
-    #     You can widen only 'p' via per_param_sigma={"p": 2.0}.
-    #     """
-    #     per_param_sigma = per_param_sigma or {}
-    #     if hasattr(self, "output_heads"):
-    #         for pname, head in self.output_heads.items():
-    #             if hasattr(head, "sigma_head"):
-    #                 # find final Linear in the sigma_head Sequential
-    #                 last_linear = None
-    #                 for m in reversed(head.sigma_head):
-    #                     if isinstance(m, nn.Linear):
-    #                         last_linear = m
-    #                         break
-    #                 if last_linear is not None and last_linear.bias is not None:
-    #                     # desired sigma for this param
-    #                     target_sigma = float(per_param_sigma.get(pname, default_sigma))
-    #                     # your forward does: sigma = softplus(sigma_out) + 1e-6
-    #                     # so we invert softplus on (target_sigma - 1e-6)
-    #                     pre_sp = self._inv_softplus(max(target_sigma - 1e-6, 1e-6))
-    #                     last_linear.bias.data.fill_(pre_sp)
-    #                     print(f"[init] MDN σ-bias for '{pname}' set for ~{target_sigma}")
 
     def _make_spatial_layer_2d(self, block_2d, planes, num_blocks, stride, use_batchnorm):
         downsample = None
@@ -390,18 +396,59 @@ class Spectral2DResNet(nn.Module):
             output_list = [self.head_outputs[param](attended[:, i]) for i, param in enumerate(self.target_params_list)]
             output = torch.cat(output_list, dim=1)
         else:
-            if self.use_mdn:
-                outputs = []
-                # Ensure a consistent order by iterating over the list of parameter names
-                for param_name in self.target_params_list:
-                    mdn_output = self.output_heads[param_name](shared_features)
-                    outputs.append(mdn_output['mu'])
-                    outputs.append(mdn_output['sigma'])
-                # Return a flat tuple of tensors
-                return tuple(outputs)
-            else:
-                output_list = [self.output_heads[param](shared_features) for param in self.output_heads]
-                output = torch.cat(output_list, dim=1)
+            # if self.use_mdn and self.covariance_type == "full":
+            #     mu = torch.cat([self.output_heads[n](shared_features)["mu"] for n in self.target_params_list], dim=1)
+            #     cov = self.cov_head(shared_features)        # {"L": (B,d,d), "sigma_diag": (B,d)}
+            #     return {"mu": mu, "L": cov["L"], "sigma": cov["sigma_diag"]}  # σ is derived from L for compatibility
+            # else:
+            #     if self.use_mdn:
+            #         outputs = []
+            #         # Ensure a consistent order by iterating over the list of parameter names
+            #         for param_name in self.target_params_list:
+            #             mdn_output = self.output_heads[param_name](shared_features)
+            #             outputs.append(mdn_output['mu'])
+            #             outputs.append(mdn_output['sigma'])
+            #         # Return a flat tuple of tensors
+            #         return tuple(outputs)
+            #     else:
+            #         output_list = [self.output_heads[param](shared_features) for param in self.output_heads]
+            #         output = torch.cat(output_list, dim=1)
+            # collect per-parameter μ (and σ if diagonal)
+            mus_list, sigmas_list = [], []
+            for pname in self.target_params_list:
+                out_p = self.output_heads[pname](shared_features)  # {'mu': (B,K_or_1), 'sigma': (B,K_or_1)?}
+                mus_list.append(out_p['mu'])
+                if self.use_mdn and self.covariance_type == "diagonal":
+                    sigmas_list.append(out_p['sigma'])
+
+            # stack into (B,K,d) if K>1 else (B,1,d) -> squeeze to (B,d)
+            K = int(self.num_mixtures)
+            mu = torch.stack(mus_list, dim=-1)               # (B,K_or_1,d)
+            if K == 1: mu = mu.squeeze(1)                    # (B,d)
+
+            if self.use_mdn and self.covariance_type == "full":
+                cov = self.cov_head(shared_features)
+                if K == 1:
+                    # old path (unchanged)
+                    return {"mu": mu, "L": cov["L"]}         # (B,d), (B,d,d)
+                else:
+                    pi_logits = self.pi_head(shared_features) # (B,K)
+                    L = cov["L"]                              # (B,K,d,d)
+                    return {"pi_logits": pi_logits, "mu": mu, "L": L}  # mixture full-cov
+
+            if self.use_mdn and self.covariance_type == "diagonal":
+                sigma = torch.stack(sigmas_list, dim=-1)     # (B,K_or_1,d)
+                if K == 1:
+                    # keep your original per-parameter tuple behavior if your Lightning expects it
+                    # (mu1, sigma1, mu2, sigma2, ...)
+                    flat = []
+                    for j in range(mu.shape[1]):  # d
+                        flat.append(mu[:, j:j+1])     # (B,1)
+                        flat.append(sigma[:, j:j+1])  # (B,1)
+                    return tuple(flat)
+                else:
+                    pi_logits = self.pi_head(shared_features) # (B,K)
+                    return {"pi_logits": pi_logits, "mu": mu, "sigma": sigma}  # mixture diagonal
 
         if not torch.isfinite(output).all():
             raise ValueError("NaNs in final output")
@@ -475,7 +522,9 @@ def generate_2d_model(config_name="s1_spec_conv_like", TARGET_PARAMETERS=["D", "
         'dropout_prob': 0.2,
         'use_batchnorm': False,         # Toggle between BatchNorm and GroupNorm
         'fc_hidden_dim': 512,
-        'target_params_list': TARGET_PARAMETERS
+        'target_params_list': TARGET_PARAMETERS,
+        'covariance_type': "full",  # "full" or "diagonal"
+        'num_mixtures': 1         # For MDN
     }
     
 
@@ -755,42 +804,151 @@ def evaluate_calibration(mu, sigma, y_true, param_names, job_id, epoch, folder_n
     print("Calibration factors found:", {k: round(v, 3) for k, v in calibration_factors.items()})
     return calibration_factors
 
+"""Helper Functions"""
+def _rand_cauchy(shape, *, device, generator=None, dtype=torch.float32):
+    # Inverse-CDF: tan(pi*(U-0.5))
+    u = torch.rand(shape, device=device, generator=generator, dtype=dtype)
+    return torch.tan(torch.pi * (u - 0.5))
+    
+def _sample_truncated_folded_cauchy(mu: float, sigma: float, threshold: float,
+                                    shape, *, device, generator=None, max_iters: int = 10):
+    """
+    Samples |Cauchy(0,1)| scaled and shifted: mu + sigma * |Cauchy|
+    If threshold > 0, resamples values > threshold (up to max_iters).
+    Returns tensor of shape, dtype float32, device=device.
+    """
+    out = mu + sigma * torch.abs(_rand_cauchy(shape, device=device, generator=generator))
+    if threshold > 0:
+        mask = out > threshold
+        it = 0
+        while mask.any() and it < max_iters:
+            resample = mu + sigma * torch.abs(_rand_cauchy(mask.sum().item(),
+                                                           device=device, generator=generator))
+            out[mask] = resample
+            mask = out > threshold
+            it += 1
+    return out
+
+def _apply_noise_and_mask_on_device(
+    x: torch.Tensor,
+    *,
+    gen: torch.Generator,
+    use_cauchy_gauss: bool = True,
+    cauchy_mu: float = 0.003,
+    cauchy_sigma: float = 0.0032,
+    cauchy_threshold: float = 0.07,
+    add_gauss_sigma: float = 0.0,
+    mask_frac: float = 0.0,
+    mask_mode: str = "sample",
+):
+    device = x.device
+
+    # ---- Noise ----
+    if use_cauchy_gauss:
+        # Per-sample RMS -> (B,1,1,1,...) broadcast
+        shape_rms = (x.shape[0],) + (1,) * (x.ndim - 1)
+        rms = _sample_truncated_folded_cauchy(
+            cauchy_mu, cauchy_sigma, cauchy_threshold,
+            shape_rms, device=device, generator=gen
+        ).to(torch.float32)
+
+        # NOTE: torch.randn_like(...) doesn't accept generator => use torch.randn(...)
+        noise = torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * rms
+        if add_gauss_sigma > 0.0:
+            noise = noise + torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)
+        # >>> ONLY add noise where signal is non-zero <<<
+        signal_mask = (x != 0).to(x.dtype)
+        x = x + (noise.to(x.dtype) * signal_mask)
+
+    elif add_gauss_sigma > 0.0:
+        noise = torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)
+        # >>> ONLY add noise where signal is non-zero <<<
+        signal_mask = (x != 0).to(x.dtype)
+        x = x + (noise.to(x.dtype) * signal_mask)
+
+
+    # ---- Mask ----
+    if mask_frac > 0.0:
+        if mask_mode == "sample":
+            b = x.shape[0]
+            k = int(round(mask_frac * b))
+            if k > 0:
+                perm = torch.randperm(b, generator=gen, device=device)
+                drop_idx = perm[:k]
+                m = torch.ones((b,) + (1,) * (x.ndim - 1), device=device, dtype=x.dtype)
+                m[drop_idx] = 0
+                x = x * m
+        elif mask_mode == "element":
+            keep_prob = 1.0 - mask_frac
+            # NOTE: torch.rand_like(...) doesn't accept generator => use torch.rand(...)
+            m = (torch.rand(x.shape, device=device, generator=gen) < keep_prob).to(x.dtype)
+            x = x * m
+        else:
+            raise ValueError(f"Unknown mask_mode: {mask_mode}")
+
+    return x
+
 # Plotting the first 10 average spectra from the train loader
-
-def plot_diagnostic_spectra(dataset, num_samples, job_id, freq_axis, output_dir):
+def plot_diagnostic_spectra(dataset, num_samples, job_id, freq_axis, output_dir, noise_cfg: dict):
     """
-    Loads a few samples from the dataset, computes the spatially-averaged 
-    spectrum for EACH sample, and saves them as separate plots for visual inspection.
+    Loads samples, applies the same on-GPU noise augmentation used in training,
+    and saves plots of the noised spectra for visual inspection.
     """
-    print(f"Generating {num_samples} diagnostic plots...")
+    print(f"Generating {num_samples} noised diagnostic plots...")
 
-    # --- Step 1: Collect the first `num_samples` directly from dataset ---
-    collected_samples = []  # tuples of (cube, rms)
+    # --- Step 1: Collect and noise samples ---
+    collected_samples = []  # List of tuples: (noised_cube, noise_rms_added)
+    
+    # First, determine the device we will be working on.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Now, create the generator and explicitly place it on that same device.
+    gen = torch.Generator(device=device)
+
     for idx in range(min(num_samples, len(dataset))):
-        x, _, rms = dataset[idx]   # access dataset directly (no sampler)
-        # x is typically [1, C, H, W] or [C, H, W]
-        if x.ndim == 4 and x.shape[0] == 1:
-            x = x.squeeze(0)
-        collected_samples.append((x, float(rms)))
+        # Get the original, clean data from the dataset
+        x_clean, _ = dataset[idx]
+        
+        if x_clean.ndim == 4 and x_clean.shape[0] == 1:
+            x_clean = x_clean.squeeze(0)
+
+        # NEW: The noise function expects a batch. Add a temporary batch dimension.
+        x_batch = x_clean.unsqueeze(0)
+
+        # NEW: Apply the same noise function used in the training loop
+        # We assume the data is on CPU and move it to GPU if available for the noise function
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        x_noised_batch = _apply_noise_and_mask_on_device(
+            x_batch.to(device),
+            gen=gen,
+            **noise_cfg
+        ).cpu() # Move the result back to CPU for plotting
+
+        # NEW: Get the noised tensor and remove the temporary batch dimension
+        x_noised = x_noised_batch.squeeze(0)
+
+        # NEW: Calculate the RMS of the noise that was actually added
+        added_noise = x_noised - x_clean
+        noise_rms = torch.std(added_noise).item()
+
+        collected_samples.append((x_noised, noise_rms))
 
     if not collected_samples:
         print("Could not retrieve any samples for diagnostic plot.")
         return
 
-    # --- Step 2: Loop through each collected sample and create a plot ---
+    # --- Step 2: Loop through each noised sample and create a plot ---
     plot_dir = f"{output_dir}/Diagnostic_Plots/{job_id}/"
     os.makedirs(plot_dir, exist_ok=True)
 
-    for i, (spectrum_cube, noise_rms) in enumerate(collected_samples):
-        # spectrum_cube has shape [channels, height, width]
-        height, width = spectrum_cube.shape[1], spectrum_cube.shape[2]
+    print("Fetching noise data worked, producing spectra...")
 
-        # Extract 1D spectrum from central pixel
+    for i, (spectrum_cube, noise_rms) in enumerate(collected_samples):
+        height, width = spectrum_cube.shape[1], spectrum_cube.shape[2]
         spectrum_1d = spectrum_cube[:, height // 2, width // 2].cpu().numpy()
 
-        # --- SNR CALCULATION ---
+        # --- SNR CALCULATION (now using the calculated noise RMS) ---
         snr_text = "SNR: N/A"
-        if noise_rms > 0 and freq_axis is not None:
+        if noise_rms > 0 and freq_axis is not None: # MODIFIED: Check if noise_rms is positive
             C_KMS = 299792.458
             FREQ_K3_GHZ = 220.7090170
             VEL_WINDOW_KMS = 10
@@ -798,9 +956,11 @@ def plot_diagnostic_spectra(dataset, num_samples, job_id, freq_axis, output_dir)
             k3_freq_min, k3_freq_max = FREQ_K3_GHZ - freq_window_ghz, FREQ_K3_GHZ + freq_window_ghz
             k3_mask = (freq_axis >= k3_freq_min) & (freq_axis <= k3_freq_max)
             if np.any(k3_mask):
+                # Calculate signal peak on the NOISY spectrum
                 signal_peak = spectrum_cube[k3_mask, :, :].max().item()
                 snr = signal_peak / noise_rms
-                snr_text = f"SNR (Peak/RMS): {snr:.2f}\nRMS drawn: {noise_rms:.4f}"
+                # RESTORED: This text is now meaningful
+                snr_text = f"SNR (Peak/RMS): {snr:.2f}\nRMS added: {noise_rms:.4f}"
             else:
                 snr_text = "SNR: k=3 line not in range"
 
@@ -809,7 +969,7 @@ def plot_diagnostic_spectra(dataset, num_samples, job_id, freq_axis, output_dir)
         x_axis = freq_axis if freq_axis is not None else np.arange(len(spectrum_1d))
         xlabel = "Frequency (GHz)" if freq_axis is not None else "Channel Number"
 
-        plt.plot(x_axis, spectrum_1d)
+        plt.plot(x_axis, spectrum_1d, label="Noised Spectrum") # MODIFIED: Label clarifies this is noised
 
         if freq_axis is not None:
             FREQ_REST_13CO_GHZ = 220.4039
@@ -817,13 +977,15 @@ def plot_diagnostic_spectra(dataset, num_samples, job_id, freq_axis, output_dir)
             freq_width_ghz = FREQ_REST_13CO_GHZ * (VEL_WIDTH_KMS / C_KMS)
             freq_min, freq_max = FREQ_REST_13CO_GHZ - freq_width_ghz, FREQ_REST_13CO_GHZ + freq_width_ghz
             plt.axvspan(freq_min, freq_max, color='red', alpha=0.2, label='Masked ¹³CO Region')
-            plt.legend()
+        
+        plt.legend() # MODIFIED: Added legend to show labels
 
+        # RESTORED: The SNR text box is now useful again
         plt.text(0.02, 0.95, snr_text, transform=plt.gca().transAxes,
                  fontsize=12, verticalalignment='top',
                  bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5))
 
-        plt.title(f"Diagnostic Spectrum - Sample {i+1}")
+        plt.title(f"Diagnostic Spectrum with Training Noise - Sample {i+1}") # MODIFIED: Title is more descriptive
         plt.xlabel(xlabel)
         plt.ylabel("Central Pixel Intensity")
         plt.grid(True)
@@ -1293,6 +1455,8 @@ if __name__ == "__main__":
     parser.add_argument("--cauchy-mu", type=float, default=0.003, help="Location parameter for Cauchy noise RMS in Jy/beam. Default corresponds to 0.3K.")
     parser.add_argument("--cauchy-sigma", type=float, default=0.0032, help="Scale parameter for Cauchy noise RMS in Jy/beam. Default corresponds to 0.32K.")
     parser.add_argument("--cauchy-threshold", type=float, default=0.07, help="Maximum allowed noise RMS in Jy/beam. Default corresponds to 7K.")
+    parser.add_argument("--covariance_type", type=str, default="full", help="Type of covariance for MDN: diagonal or full")
+    parser.add_argument("--num-mixtures", type=int, default=1, help="Number of mixtures for MDN")
     args = parser.parse_args()
 
     print(f"Saving plots and checkpoints in folder: {args.folder_name}")
@@ -1390,8 +1554,7 @@ if __name__ == "__main__":
     use_mdn = args.use_mdn  # Set to True if you want to use MDN heads, False otherwise
     #use_attention_heads = args.use_attention_heads  # Set to True if you want to use attention heads, False otherwise
     print(f'Using parameter heads with an attention mechanism, use_attention_heads={use_attention_heads}') if use_attention_heads else print(f'Using simple feature heads, use_attention_heads={use_attention_heads}')
-    #model = generate_2d_model(config_name=config_name,use_batchnorm=False, target_params_list=TARGET_PARAMETERS, n_outputs=num_outputs, use_attention_heads=use_attention_heads, attention_latent_dim=128)
-    model = generate_2d_model(config_name=config_name, use_batchnorm=False, TARGET_PARAMETERS=TARGET_PARAMETERS, n_outputs=num_outputs, use_attention_heads=use_attention_heads, attention_latent_dim=128)
+    model = generate_2d_model(config_name=config_name, use_batchnorm=False, TARGET_PARAMETERS=TARGET_PARAMETERS, n_outputs=num_outputs, use_attention_heads=use_attention_heads, attention_latent_dim=128, use_mdn=use_mdn, covariance_type=args.covariance_type, num_mixtures=args.num_mixtures)
 
     # Trying to use multi GPUs 
     print(f"Number of GPUs available: {torch.cuda.device_count()}")
@@ -1400,39 +1563,16 @@ if __name__ == "__main__":
         model = nn.DataParallel(model)
 
     model = model.to(device)
-    #model = torch.compile(model)
 
     # Print model structure
     print(f"Config name: {config_name}")
     print(model)
     
 
-    #from torchviz import make_dot
-    #model_graph = make_dot(model(sample_image.to(device)[:1]), params=dict(model.named_parameters()))
-    #model_graph.render("plots/model_graph", format="png")
-    #print("Saved model graph to plots/model_graph.png")
-
-    #from torchsummary import summary
-    # Show model summary
-    #summary(model, input_size=(1, 2000, 100, 100), device=str(device))
-
-    #weights_path = f"model_weights.pth"
-    #if os.path.exists(weights_path):
-    #    model.load_state_dict(torch.load(weights_path))
-    #    print("Model weights loaded.")
-    #else:
-    #    print("Model weights file not found")
-
-    #criterion = nn.L1Loss()
-    #criterion = WeightedMSELoss(weights=[1.0, 1.0, 5.0, 5.0])  # Adjust weights as needed
     criterion = nn.MSELoss(reduction='mean')
-    #criterion = nn.HuberLoss(delta=0.1, reduction='mean')
     optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-5)
     scaler = GradScaler('cuda')
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=1e-6)
-    #scheduler = optim.lr_scheduler.CyclicLR(optimizer, base_lr=1e-6, max_lr=1e-4)
-    #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1) # Example: Decrease LR every 10 epochs
-
 
     # Print criterion, optimizer, scaler and scheduler information
     if use_mdn:

@@ -535,6 +535,65 @@ def create_dataloaders(
     print("[DEBUG] Finished create_dataloaders", flush=True)
     return train_loader, val_loader, ds_full
 
+ # ------------------ Test-only: load ALL files ------------------ #
+def create_test_loader(
+    fits_dir,
+    scaling_params_path,
+    wavelength_stride=1,
+    load_preprocessed=False,
+    preprocessed_dir=None,
+    use_local_nvme=False,
+    batch_size=16,
+    num_workers=8,
+    model_params=("D","L","ro","rr","p","Tlow","NCH3CN","plummer_shape"),
+    log_scale_params=("D","L","NCH3CN"),
+    mask_13co=True,
+    test_sampler=None,
+):
+    """
+    Build a DataLoader over *all* files in `fits_dir` (no subset, no split),
+    using the label scalers saved during training.
+    """
+    # Load scalers saved by training
+    scaling = torch.load(scaling_params_path)
+    loaded_params  = scaling.get("params", None)
+    current_params = list(model_params)
+    if (loaded_params is None) or (loaded_params != current_params):
+        raise ValueError(
+            "[TEST] The parameter order in your data.model_params does not "
+            "match the scalers file. Please use the same order as training.\n"
+            f"scalers params: {loaded_params}\ncurrent: {current_params}"
+        )
+
+    # Build a dataset from *all* files found under fits_dir
+    ds_full = FitsDataset(
+        fits_dir=fits_dir, file_list=None,   # None -> enumerate everything
+        wavelength_stride=wavelength_stride,
+        use_local_nvme=use_local_nvme,
+        load_preprocessed=load_preprocessed,
+        preprocessed_dir=preprocessed_dir or fits_dir,
+        model_params=current_params,
+        log_scale_params=list(log_scale_params),
+        mask_13co=mask_13co,
+    )
+    # Use training scalers exactly
+    ds_full.set_scaling_params(scaling["means"], scaling["stds"])
+
+    # Non-shuffling DataLoader over the full dataset
+    test_loader = DataLoader(
+        ds_full,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=test_sampler,           # let Lightning inject DistributedSampler if needed
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=1,
+        drop_last=False,
+    )
+    return test_loader, ds_full
+
+
 # ------------------ CLI ------------------ #
 if __name__ == "__main__":
     import argparse

@@ -99,18 +99,21 @@ def main(cfg: DictConfig):
 
     if mode == "train":
         trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
-        trainer.validate(model, datamodule=datamodule)  # optional
     elif mode == "validate":
         trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt_path)
     elif mode == "test":
         trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
 
-    # --- Fit ---
-    trainer.fit(model, datamodule=datamodule)
+    # --- Safe metric return depending on mode ---
+    metrics = trainer.callback_metrics
+    if mode == "test":
+        return float(metrics.get("test/loss", 0.0))
+    elif mode == "validate":
+        return float(metrics.get("val/loss", 0.0))
+    else:  # train
+        # prefer val/loss if logged; otherwise fall back to train/loss
+        return float(metrics.get("val/loss", metrics.get("train/loss", 0.0)))
 
-    # Optional: test if defined
-    trainer.validate(model, datamodule=datamodule)
-    return trainer.callback_metrics["val_loss"].item()
 
 if __name__ == "__main__":
     main()

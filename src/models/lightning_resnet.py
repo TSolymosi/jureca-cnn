@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from lightning.pytorch import LightningModule
 import torch.distributed as dist
 from typing import Optional, Dict, List, Tuple
+from contextlib import nullcontext
+import math
 
 from ResNet3D import generate_2d_model  # keep your import
 
@@ -92,10 +94,16 @@ def _apply_noise_and_mask_on_device(
         noise = torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * rms
         if add_gauss_sigma > 0.0:
             noise = noise + torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)
-        x = x + noise.to(x.dtype)
+        # >>> ONLY add noise where signal is non-zero <<<
+        signal_mask = (x != 0).to(x.dtype)
+        x = x + (noise.to(x.dtype) * signal_mask)
 
     elif add_gauss_sigma > 0.0:
-        x = x + (torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)).to(x.dtype)
+        noise = torch.randn(x.shape, device=device, dtype=torch.float32, generator=gen) * float(add_gauss_sigma)
+        # >>> ONLY add noise where signal is non-zero <<<
+        signal_mask = (x != 0).to(x.dtype)
+        x = x + (noise.to(x.dtype) * signal_mask)
+
 
     # ---- Mask ----
     if mask_frac > 0.0:
@@ -154,6 +162,8 @@ class LitResNetMDN(LightningModule):
             use_attention_heads=model_cfg.use_attention_heads,
             attention_latent_dim=model_cfg.attention_latent_dim,
             use_mdn=model_cfg.use_mdn,
+            covariance_type=model_cfg.covariance_type,
+            num_mixtures=model_cfg.num_mixtures
         )
         self.model_params: List[str] = model_cfg.target_params
         self.use_mdn: bool = model_cfg.use_mdn
@@ -175,6 +185,15 @@ class LitResNetMDN(LightningModule):
         self._val_sigmas: Optional[List[torch.Tensor]] = [] if self.use_mdn else None
         self._val_cache: Dict[str, Optional[torch.Tensor]] = {}
 
+        # cache for TEST epoch end (rank0 only)
+        self._test_dataset = None
+        self._test_preds:   List[torch.Tensor] = []
+        self._test_targets: List[torch.Tensor] = []
+        self._test_sigmas:  Optional[List[torch.Tensor]] = [] if self.use_mdn else None
+        self._test_Ls:      Optional[List[torch.Tensor]] = [] if (self.use_mdn and model_cfg.covariance_type == "full") else None
+        self._test_cache:   Dict[str, Optional[torch.Tensor]] = {}
+
+
         # ---- Store augmentation config ----
         self.apply_aug_train_only = apply_aug_train_only
         self.aug_use_cauchy_gauss = use_cauchy_gauss
@@ -184,6 +203,9 @@ class LitResNetMDN(LightningModule):
         self.aug_add_gauss_sigma = add_gauss_sigma
         self.aug_mask_frac = mask_frac
         self.aug_mask_mode = mask_mode  # "sample" or "element"
+
+        # Covariance type for MDN: "full" or "diagonal"
+        self.covariance_type = model_cfg.covariance_type
 
     # ------------------- Lightning lifecycle -------------------
 
@@ -229,6 +251,16 @@ class LitResNetMDN(LightningModule):
         self._val_preds = []
         self._val_targets = []
         self._val_sigmas = [] if self.use_mdn else None
+        self._val_Ls = [] if (self.use_mdn and self.covariance_type == "full") else None
+
+    def on_test_epoch_start(self):
+        self._test_dataset = getattr(self.trainer.datamodule, "dataset_ref", None)
+        self._test_preds = []
+        self._test_targets = []
+        self._test_sigmas = [] if self.use_mdn else None
+        self._test_Ls = [] if (self.use_mdn and self.covariance_type == "full") else None
+        self._test_cache = {}
+
 
     # ------------------------- Helpers -------------------------
 
@@ -317,8 +349,9 @@ class LitResNetMDN(LightningModule):
             "p": 0.05, "Tlow": 0.05, "plummer_shape": 0.05, "NCH3CN": 0.05
         }
 
-        import torch as _torch
-        with _torch.autocast(device_type="cuda", enabled=False):
+        #with torch.autocast(device_type="cuda", enabled=False):
+        ac = torch.amp.autocast('cuda', enabled=False) if torch.cuda.is_available() else nullcontext()
+        with ac:
             for i, name in enumerate(self.model_params):
                 mu    = output[i*2].squeeze(-1).float()
                 sigma = output[i*2+1].squeeze(-1).float()
@@ -330,9 +363,135 @@ class LitResNetMDN(LightningModule):
                 if sigma_reg:
                     w = sigma_reg_weights.get(name, 0.0)
                     if w > 0:
-                        reg_term += w * _torch.mean(_torch.log(var))
-        loss = _torch.stack(losses, dim=1).mean() + reg_term
+                        reg_term += w * torch.mean(torch.log(var))
+        loss = torch.stack(losses, dim=1).mean() + reg_term
         return (loss, per_param) if return_per_param else loss
+
+
+    # Covariance helpers
+    @staticmethod
+    def _is_fullcov_out(out) -> bool:
+        """True when model returns a dict with full-covariance pieces."""
+        return isinstance(out, dict) and ("mu" in out) and ("L" in out)
+
+    @staticmethod
+    def _split_mdn_tuple(output, n_params: int):
+        """Takes flat tuple (mu1, sigma1, mu2, sigma2, ...) -> (mus[B,d], sigmas[B,d])"""
+        mus, sigmas = [], []
+        for i in range(n_params):
+            mu_i    = output[i * 2].squeeze(-1)
+            sigma_i = output[i * 2 + 1].squeeze(-1)
+            mus.append(mu_i)
+            sigmas.append(sigma_i)
+        return torch.stack(mus, dim=1) if mus[0].ndim == 1 else torch.cat([m.unsqueeze(1) for m in mus], dim=1), \
+            torch.stack(sigmas, dim=1) if sigmas[0].ndim == 1 else torch.cat([s.unsqueeze(1) for s in sigmas], dim=1)
+
+
+    def _mvn_nll_from_cholesky(self, mu: torch.Tensor, L: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        AMP-safe MVN NLL with Σ = L L^T (L lower-triangular).
+        We do the triangular solve + logdet in float32 for numerical stability.
+        A tiny jitter is added on the diagonal to avoid singularities early in training.
+        """
+        if mu.ndim != 2:
+            mu = mu.view(mu.shape[0], -1)
+        if y.ndim != 2:
+            y = y.view(y.shape[0], -1)
+
+        ac = nullcontext()
+        # if autocast is active, disable for the linear algebra
+        try:
+            ac = torch.amp.autocast('cuda', enabled=False) if mu.is_cuda else nullcontext()
+        except Exception:
+            ac = nullcontext()
+
+        with ac:
+            mu32, L32, y32 = mu.float(), L.float(), y.float()
+            # ensure lower-triangular and positive diag
+            L32 = torch.tril(L32)
+            
+            eye = torch.eye(L32.shape[-1], device=L32.device, dtype=L32.dtype).unsqueeze(0)
+            L32 = L32 + 1e-6 * eye  # jitter
+            # triangular solve & logdet in fp32
+            diff = (y32 - mu32).unsqueeze(-1)
+            z = torch.linalg.solve_triangular(L32, diff, upper=False)
+            maha = z.square().sum(dim=(-2, -1))
+            diag = torch.diagonal(L32, dim1=-2, dim2=-1)
+            logdet = 2.0 * torch.log(diag).sum(dim=-1)
+            const = mu32.shape[-1] * math.log(2.0 * math.pi)
+            nll = 0.5 * (maha + logdet + const)
+            loss = nll.mean()
+        #return loss
+        return loss.to(mu.dtype)
+
+    # --- mixture of Gaussians (mog) NLLs + marginals ---
+    def _mog_nll_diag(self, pi_logits, mu, sigma, y):
+        """
+        Diagonal mixture NLL.
+        Shapes:
+        pi_logits: (B,K)
+        mu:        (B,K,d)
+        sigma:     (B,K,d)  (positive)
+        y:         (B,d)
+        """
+        log_pi = F.log_softmax(pi_logits, dim=-1)         # (B,K)
+        y_exp = y.unsqueeze(1)                            # (B,1,d)
+        var   = (sigma * sigma).clamp_min(1e-12)          # (B,K,d)
+        const = mu.size(-1) * math.log(2.0 * math.pi)
+        log_det = var.log().sum(-1)                       # (B,K)
+        maha = ((y_exp - mu).square() / var).sum(-1)      # (B,K)
+        log_prob = -0.5 * (const + log_det + maha)        # (B,K)
+        return -(log_pi + log_prob).logsumexp(dim=-1).mean()
+
+    def _mog_nll_full(self, pi_logits, mu, L, y):
+        """
+        Full-cov mixture NLL using Cholesky L.
+        Shapes:
+        pi_logits: (B,K)
+        mu:        (B,K,d)
+        L:         (B,K,d,d)  (lower-tri; diag made positive here)
+        y:         (B,d)
+        """
+        B, K, d = mu.shape
+        log_pi = F.log_softmax(pi_logits, dim=-1)         # (B,K)
+
+        # enforce lower-tri + positive diag
+        L = torch.tril(L)
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        diag_pos = F.softplus(diag) + 1e-3
+        L = L - torch.diag_embed(diag) + torch.diag_embed(diag_pos)
+
+        ac = torch.amp.autocast('cuda', enabled=False) if y.is_cuda else nullcontext()
+        with ac:
+            y_mu = (y.unsqueeze(1) - mu).unsqueeze(-1)    # (B,K,d,1)
+            z = torch.linalg.solve_triangular(L.float(), y_mu.float(), upper=False)
+            maha = z.square().sum(dim=(-2, -1))           # (B,K)
+            logdet = 2.0 * diag_pos.float().log().sum(-1) # (B,K)
+            const = d * math.log(2.0 * math.pi)
+            log_prob = -0.5 * (maha + logdet + const)     # (B,K)
+
+        return -(log_pi + log_prob).logsumexp(dim=-1).mean().to(mu.dtype)
+
+    @staticmethod
+    def _mixture_marginals_diag(pi_logits, mu, sigma):
+        """Return (mu_mix[B,d], sig_mix[B,d]) for diagonal mixtures."""
+        pi = F.softmax(pi_logits, dim=-1)                 # (B,K)
+        mu_mix = (pi.unsqueeze(-1) * mu).sum(dim=1)       # (B,d)
+        var_k = (sigma * sigma)                           # (B,K,d)
+        second = (pi.unsqueeze(-1) * (var_k + mu * mu)).sum(dim=1)  # (B,d)
+        var_mix = (second - mu_mix * mu_mix).clamp_min(1e-12)
+        return mu_mix, var_mix.sqrt()
+
+    @staticmethod
+    def _mixture_marginals_full(pi_logits, mu, L):
+        """Return (mu_mix[B,d], sig_mix[B,d]) using diag Σ_k = sum_j L_ij^2."""
+        pi = F.softmax(pi_logits, dim=-1)                 # (B,K)
+        mu_mix = (pi.unsqueeze(-1) * mu).sum(dim=1)       # (B,d)
+        diagSigma_k = (L * L).sum(dim=-1)                 # (B,K,d)
+        second = (pi.unsqueeze(-1) * (diagSigma_k + mu * mu)).sum(dim=1)
+        var_mix = (second - mu_mix * mu_mix).clamp_min(1e-12)
+        return mu_mix, var_mix.sqrt()
+
 
     # --------------------- training / val / test ---------------------
 
@@ -364,96 +523,318 @@ class LitResNetMDN(LightningModule):
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
-        # ---- Fast on-GPU noise + masking ----
+        # (optional) on-GPU augments exactly as before
         x = self._maybe_augment_on_device(x)
 
         self._sanity_checks(x, y, batch_idx)
 
-        output = self(x)
+        use_amp = x.is_cuda and isinstance(getattr(self.trainer, "precision", ""), str) and "mixed" in self.trainer.precision
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            out = self(x)
 
-        if not self.use_mdn and (output.shape != y.shape):
-            raise RuntimeError(f"Output-target shape mismatch: {output.shape} vs {y.shape}")
+        if isinstance(out, dict) and ("pi_logits" in out):
+            # ---- MIXTURE PATH (K>1) ----
+            if "sigma" in out:   # diagonal mixture
+                loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
+                with torch.no_grad():
+                    mu_mix, sig_mix = self._mixture_marginals_diag(out["pi_logits"], out["mu"], out["sigma"])
+            else:                 # full-cov mixture (has 'L')
+                loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
+                with torch.no_grad():
+                    mu_mix, sig_mix = self._mixture_marginals_full(out["pi_logits"], out["mu"], out["L"])
 
-        loss, per_param = self._compute_loss(output, y, return_per_param=True)
+                # optional: keep a heatmap source for mixtures (top-weight component)
+                if "L" in out:
+                    pi = F.softmax(out["pi_logits"], dim=-1)
+                    top = pi.argmax(dim=-1)                                  # (B,)
+                    L_top = out["L"][torch.arange(out["L"].size(0)), top]    # (B,d,d)
+                    cache = getattr(self, "_val_cache", {})
+                    cache.setdefault("Ls", []).append(L_top.detach().cpu())
+                    self._val_cache = cache
 
-        if batch_idx == 0 and self.trainer.is_global_zero and self.use_mdn:
-            self.print(f"[DEBUG] first-batch train_loss: {loss.item():.6f}")
-            with torch.no_grad():
+            self.log(f"train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return loss
+
+        # ---- FULL COVARIANCE PATH ----
+        if self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
+            mu, L = out["mu"], out["L"]
+            loss = self._mvn_nll_from_cholesky(mu, L, y)
+
+            # --- gentle diag-σ calibration in standardized space ---
+            # config-driven targets & weights (defaults below)
+            targets = getattr(self.hparams.model_cfg, "cov_diag_targets", {})
+            weights = getattr(self.hparams.model_cfg, "cov_diag_weights", {})
+            use_log = bool(getattr(self.hparams.model_cfg, "cov_diag_use_log", False))
+
+            if targets or weights:
+                with torch.no_grad():
+                    sigma_diag = torch.sqrt((L.float().square()).sum(dim=-1))  # (B, d)
+                # map param name -> column index
+                name2idx = {n: i for i, n in enumerate(self.model_params)}
+                reg_terms = []
+                for name, w in weights.items():
+                    if w <= 0 or name not in name2idx:
+                        continue
+                    i = name2idx[name]
+                    tgt = float(targets.get(name, 1.0))
+                    if use_log:
+                        reg = (torch.log(sigma_diag[:, i].clamp_min(1e-6)) - math.log(tgt))**2
+                    else:
+                        reg = (sigma_diag[:, i] - tgt)**2
+                    reg_terms.append(w * reg.mean())
+                if reg_terms:
+                    loss = loss + torch.stack(reg_terms).sum()
+            # ------------------------------------------------------------
+
+            self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return loss
+
+        # ---- DIAGONAL (old) PATH ----
+        if self.use_mdn:
+            # original tuple output (mu_i, sigma_i, ...)
+            loss, per_param = self._compute_loss(out, y, return_per_param=True)
+
+            if batch_idx == 0 and self.trainer.is_global_zero:
                 for i, name in enumerate(self.model_params):
-                    mu    = output[i*2].squeeze(-1)
-                    sigma = output[i*2+1].squeeze(-1)
+                    mu_i    = out[i*2].squeeze(-1)
+                    sigma_i = out[i*2+1].squeeze(-1)
                     if not self.sigma_head_outputs_positive:
-                        sigma = F.softplus(sigma)
-                    sigma = torch.clamp(sigma, min=1e-6)
+                        sigma_i = F.softplus(sigma_i)
+                    sigma_i = torch.clamp(sigma_i, min=self.sigma_floor)
                     y_i = y[:, i]
-                    nll_i = F.gaussian_nll_loss(mu.float(), y_i.float(), (sigma*sigma).float(),
+                    nll_i = F.gaussian_nll_loss(mu_i.float(), y_i.float(), (sigma_i*sigma_i).float(),
                                                 full=True, reduction="none").mean()
                     print(f"[Lightning][{name}] y(mean±std)={y_i.mean():.3g}±{y_i.std():.3g} "
-                          f"mu={mu.mean():.3g}±{mu.std():.3g} sigma={sigma.mean():.3g} "
-                          f"NLL={nll_i.item():.6f}")
+                        f"mu={mu_i.mean():.3g}±{mu_i.std():.3g} sigma={sigma_i.mean():.3g} "
+                        f"NLL={nll_i.item():.6f}")
 
-        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        for k, v in per_param.items():
-            self.log(f"train/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
+            for k, v in per_param.items():
+                self.log(f"train/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
+            self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            #self.log("train_loss", loss, on_step=False, on_epoch=True, sync_dist=True)  # not quite sure why this is needed
+            return loss
+
+        # ---- Plain regression (no MDN) ----
+        if out.shape != y.shape:
+            raise RuntimeError(f"Output-target shape mismatch: {out.shape} vs {y.shape}")
+        loss = self.criterion(out, y)
+        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         return loss
+
 
     def validation_step(self, batch, batch_idx):
         x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
-        # No augmentation in val if apply_aug_train_only=True (default)
         if not self.apply_aug_train_only:
             x = self._maybe_augment_on_device(x)
 
         self._sanity_checks(x, y, batch_idx)
 
-        output = self(x)
+        use_amp = x.is_cuda and isinstance(getattr(self.trainer, "precision", ""), str) and "mixed" in self.trainer.precision
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            out = self(x)
 
+        if isinstance(out, dict) and ("pi_logits" in out):
+            # ---- MIXTURE PATH (K>1) ----
+            if "sigma" in out:   # diagonal mixture
+                loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
+                with torch.no_grad():
+                    mu_mix, sig_mix = self._mixture_marginals_diag(out["pi_logits"], out["mu"], out["sigma"])
+            else:                 # full-cov mixture (has 'L')
+                loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
+                with torch.no_grad():
+                    mu_mix, sig_mix = self._mixture_marginals_full(out["pi_logits"], out["mu"], out["L"])
+
+            # cache for plots
+            self._val_preds.append(mu_mix.detach().cpu())
+            self._val_targets.append(y.detach().cpu())
+            self._val_sigmas = (self._val_sigmas or [])
+            self._val_sigmas.append(sig_mix.detach().cpu())
+
+            # cache per-component tensors for visualization
+            cache = getattr(self, "_val_cache", {})
+            cache.setdefault("pi_logits_all", []).append(out["pi_logits"].detach().cpu())  # (B,K)
+            cache.setdefault("mu_all", []).append(out["mu"].detach().cpu())                # (B,K,d)
+            if "sigma" in out:
+                cache.setdefault("sigma_all", []).append(out["sigma"].detach().cpu())      # (B,K,d)
+            if "L" in out:
+                cache.setdefault("L_all", []).append(out["L"].detach().cpu())              # (B,K,d,d)
+            self._val_cache = cache
+
+            self.log(f"val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return {"val/loss": loss}
+
+
+        # FULL COV
+        if self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
+            mu, L = out["mu"], out["L"]
+            loss = self._mvn_nll_from_cholesky(mu, L, y)
+            sigma_diag = torch.sqrt((L.square()).sum(dim=-1))  # (B,d)
+
+            if not hasattr(self, "_val_Ls") or self._val_Ls is None:
+                self._val_Ls = []
+            self._val_Ls.append(L.detach().cpu())
+
+            self._val_preds.append(mu.detach().cpu())
+            self._val_targets.append(y.detach().cpu())
+            self._val_sigmas = (self._val_sigmas or [])
+            self._val_sigmas.append(sigma_diag.detach().cpu())
+
+            self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            #self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)    # not quite sure why this is needed
+            return {"val/loss": loss}
+
+        # DIAGONAL (old)
         if self.use_mdn:
-            mu_list, sigma_list = self._split_mdn(output)
-            preds  = torch.cat(mu_list, dim=1)
-            sigmas = torch.cat(sigma_list, dim=1)
-        else:
-            preds = output
-            sigmas = None
+            mus, sigmas = self._split_mdn_tuple(out, len(self.model_params))
+            # enforce positivity if your head doesn't
+            if not self.sigma_head_outputs_positive:
+                sigmas = F.softplus(sigmas)
+            sigmas = torch.clamp(sigmas, min=self.sigma_floor)
 
-        self._val_preds.append(preds.detach().cpu())
-        self._val_targets.append(y.detach().cpu())
-        if sigmas is not None:
+            self._val_preds.append(mus.detach().cpu())
+            self._val_targets.append(y.detach().cpu())
             self._val_sigmas.append(sigmas.detach().cpu())
 
-        loss, per_param = self._compute_loss(output, y, return_per_param=True)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        for k, v in per_param.items():
-            self.log(f"val/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
-        return {"val_loss": loss}
+            loss, per_param = self._compute_loss(out, y, return_per_param=True)
+            for k, v in per_param.items():
+                self.log(f"val/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
+            self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return {"val/loss": loss}
+
+        # no-MDN
+        if out.shape != y.shape:
+            raise RuntimeError(f"Output-target shape mismatch: {out.shape} vs {y.shape}")
+        loss = self.criterion(out, y)
+        self._val_preds.append(out.detach().cpu())
+        self._val_targets.append(y.detach().cpu())
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        return {"val/loss": loss}
+
+
+    
+    def on_test_start(self):
+        # init cache + keep a ref to the raw (unwrapped) dataset for inverse transforms
+        self._test_cache = {"preds": [], "targets": [], "sigmas": [], "mu": [], "L": [], "filenames": []}
+        dl = self.trainer.datamodule.test_dataloader()
+        ds = getattr(dl, "dataset", dl)
+        while hasattr(ds, "dataset"):  # unwrap Subset/Concat etc.
+            ds = ds.dataset
+        self._test_dataset = ds
 
     def test_step(self, batch, batch_idx):
         x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
+        # match validation: only augment when not "train only"
+        if not self.apply_aug_train_only:
+            x = self._maybe_augment_on_device(x)
+
         self._sanity_checks(x, y, batch_idx)
 
-        output = self(x)
-        loss, per_param = self._compute_loss(output, y, return_per_param=True)
+        use_amp = x.is_cuda and isinstance(getattr(self.trainer, "precision", ""), str) and "mixed" in self.trainer.precision
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            out = self(x)
 
-        for k, v in per_param.items():
-            self.log(f"test/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("test_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        return {"test_loss": loss}
+        # ---------------- MIXTURE (K>1) ----------------
+        if isinstance(out, dict) and ("pi_logits" in out):
+            if "sigma" in out:   # diagonal mixture
+                loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
+                with torch.no_grad():
+                    mu_mix, sig_mix = self._mixture_marginals_diag(out["pi_logits"], out["mu"], out["sigma"])
+            else:                 # full-cov mixture (has 'L')
+                loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
+                with torch.no_grad():
+                    mu_mix, sig_mix = self._mixture_marginals_full(out["pi_logits"], out["mu"], out["L"])
+
+            # cache (mirror val)
+            self._test_preds.append(mu_mix.detach().cpu())
+            self._test_targets.append(y.detach().cpu())
+            self._test_sigmas = (self._test_sigmas or [])
+            self._test_sigmas.append(sig_mix.detach().cpu())
+
+            cache = getattr(self, "_test_cache", {}) or {}
+            cache.setdefault("pi_logits_all", []).append(out["pi_logits"].detach().cpu())  # (B,K)
+            cache.setdefault("mu_all", []).append(out["mu"].detach().cpu())                # (B,K,d)
+            if "sigma" in out:
+                cache.setdefault("sigma_all", []).append(out["sigma"].detach().cpu())      # (B,K,d)
+            if "L" in out:
+                cache.setdefault("L_all", []).append(out["L"].detach().cpu())              # (B,K,d,d)
+            self._test_cache = cache
+
+            self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return {"test/loss": loss}
+
+        # ---------------- SINGLE-GAUSSIAN FULL-COV ----------------
+        if self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
+            mu, L = out["mu"], out["L"]
+            loss = self._mvn_nll_from_cholesky(mu, L, y)
+
+            sigma_diag = torch.sqrt((L.square()).sum(dim=-1))  # (B,d)  ← used for error bars
+
+            self._test_preds.append(mu.detach().cpu())
+            self._test_targets.append(y.detach().cpu())
+            self._test_sigmas = (self._test_sigmas or [])
+            self._test_sigmas.append(sigma_diag.detach().cpu())
+            if not hasattr(self, "_test_Ls") or self._test_Ls is None:
+                self._test_Ls = []
+            self._test_Ls.append(L.detach().cpu())
+
+            self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return {"test/loss": loss}
+
+        # ---------------- DIAGONAL (old) MDN ----------------
+        if self.use_mdn:
+            mus, sigmas = self._split_mdn_tuple(out, len(self.model_params))
+            if not self.sigma_head_outputs_positive:
+                sigmas = F.softplus(sigmas)
+            sigmas = torch.clamp(sigmas, min=self.sigma_floor)
+
+            self._test_preds.append(mus.detach().cpu())
+            self._test_targets.append(y.detach().cpu())
+            self._test_sigmas = (self._test_sigmas or [])
+            self._test_sigmas.append(sigmas.detach().cpu())
+
+            loss, per_param = self._compute_loss(out, y, return_per_param=True)
+            for k, v in per_param.items():
+                self.log(f"test/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
+            self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            return {"test/loss": loss}
+
+        # ---------------- PLAIN REGRESSION ----------------
+        if out.shape != y.shape:
+            raise RuntimeError(f"Output-target shape mismatch: {out.shape} vs {y.shape}")
+        loss = self.criterion(out, y)
+        self._test_preds.append(out.detach().cpu())
+        self._test_targets.append(y.detach().cpu())
+        self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        return {"test/loss": loss}
+
 
     def on_validation_epoch_end(self):
         preds_all = _gather_cat_cpu(self._val_preds)
         targets_all = _gather_cat_cpu(self._val_targets)
         sigmas_all = _gather_cat_cpu(self._val_sigmas) if self.use_mdn else None
+        Ls_all = _gather_cat_cpu(self._val_Ls) if (self._val_Ls is not None) else None
+
+        cache = getattr(self, "_val_cache", {})
+        for key in ["pi_logits_all", "mu_all", "sigma_all", "L_all"]:
+            if key in cache and isinstance(cache[key], list):
+                cache[key] = _gather_cat_cpu(cache[key])
 
         if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             self._val_cache = {
                 "preds": preds_all,
                 "targets": targets_all,
                 "sigmas": sigmas_all,
+                "Ls": Ls_all,
+                "pi_logits_all": cache.get("pi_logits_all", None),
+                "mu_all": cache.get("mu_all", None),
+                "sigma_all": cache.get("sigma_all", None),
+                "L_all": cache.get("L_all", None),
             }
         else:
             self._val_cache = {}
@@ -461,6 +842,40 @@ class LitResNetMDN(LightningModule):
         self._val_preds = []
         self._val_targets = []
         self._val_sigmas = None
+        self._val_Ls = None
+        
+
+    def on_test_epoch_end(self):
+        preds_all   = _gather_cat_cpu(self._test_preds)
+        targets_all = _gather_cat_cpu(self._test_targets)
+        sigmas_all  = _gather_cat_cpu(self._test_sigmas) if self.use_mdn else None
+        Ls_all      = _gather_cat_cpu(self._test_Ls) if (self._test_Ls is not None) else None
+
+        cache = getattr(self, "_test_cache", {}) or {}
+        for key in ["pi_logits_all", "mu_all", "sigma_all", "L_all"]:
+            if key in cache and isinstance(cache[key], list):
+                cache[key] = _gather_cat_cpu(cache[key])
+
+        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
+            self._test_cache = {
+                "preds": preds_all,
+                "targets": targets_all,
+                "sigmas": sigmas_all,
+                "Ls": Ls_all,
+                "pi_logits_all": cache.get("pi_logits_all", None),
+                "mu_all": cache.get("mu_all", None),
+                "sigma_all": cache.get("sigma_all", None),
+                "L_all": cache.get("L_all", None),
+            }
+        else:
+            self._test_cache = {}
+
+        # clear buffers
+        self._test_preds = []
+        self._test_targets = []
+        self._test_sigmas = None
+        self._test_Ls = None
+
 
     # ------------------- Optim / Scheduler -------------------
 
@@ -481,7 +896,7 @@ class LitResNetMDN(LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
+                "monitor": "val/loss",
                 "frequency": 1
             }
         }

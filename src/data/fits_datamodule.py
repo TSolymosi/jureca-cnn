@@ -1,6 +1,7 @@
 from lightning.pytorch import LightningDataModule
 from lightning.pytorch.utilities import rank_zero_only
 from dataloader import create_dataloaders
+from dataloader import create_test_loader
 import os
 
 from contextlib import suppress
@@ -57,10 +58,12 @@ class FitsDataModule(LightningDataModule):
           - subset_indices.pt
           - file_list.json
         """
+
         # Ensure parent directory exists (robust when the path is new)
         os.makedirs(os.path.dirname(self.scaling_params_path), exist_ok=True)
 
         # Trigger PREP (returns None by design)
+        print(f"[INFO] subset fraction: {self.data_subset_fraction}")
         create_dataloaders(
             fits_dir=self.fits_dir,
             scaling_params_path=self.scaling_params_path,
@@ -125,7 +128,21 @@ class FitsDataModule(LightningDataModule):
         return self.val_loader
 
     def test_dataloader(self):
-        return self.val_loader  # or a separate test loader if you have one
+        # Build a test loader if needed
+        self.test_loader, self.dataset_ref = create_test_loader(
+            fits_dir=self.fits_dir,
+            scaling_params_path=self.scaling_params_path,
+            wavelength_stride=self.wavelength_stride,
+            load_preprocessed=self.load_preprocessed,
+            preprocessed_dir=self.preprocessed_dir,
+            use_local_nvme=self.use_local_nvme,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            model_params=self.model_params,
+            log_scale_params=self.log_scale_params,
+            mask_13co=self.mask_13co,
+        )
+        return self.test_loader
 
     # Optional: for callbacks needing inverse transforms / metadata
     def get_dataset_reference(self):

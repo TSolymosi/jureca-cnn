@@ -21,6 +21,6 @@ class EpochTimeLogger(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         # read a value you logged yourself into the module (or skip metrics entirely)
         # e.g., pl_module.last_val_loss set in your LightningModule.on_validation_epoch_end
-        val_loss = getattr(pl_module, "last_val_loss", None)
+        val_loss = getattr(pl_module, "last_val/loss", None)
         if val_loss is not None:
-            print(f"[Epoch {trainer.current_epoch}] val_loss={float(val_loss):.5f}")
+            print(f"[Epoch {trainer.current_epoch}] val/loss={float(val_loss):.5f}")

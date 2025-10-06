@@ -114,6 +114,11 @@ class DataloaderDebugCallback(Callback):
 
     @rank_zero_only
     def on_fit_start(self, trainer, pl_module):
+        # model config summary
+        cfg = getattr(pl_module, "hparams", None)
+        if cfg is not None:
+            print(f"[DEBUG] >>> model hparams: {cfg}", flush=True)
+
         # Log a single, consolidated summary on rank 0 without constructing loaders again.
         dm = getattr(trainer, "datamodule", None)
         rank, world = _rank_world(trainer)
@@ -148,6 +153,7 @@ class DataloaderDebugCallback(Callback):
             f"expected_batches_per_rank(train={train_batches}, val={val_batches})",
             flush=True,
         )
+        
 
     # @rank_zero_only
     # def on_train_dataloader(self, trainer, pl_module):
