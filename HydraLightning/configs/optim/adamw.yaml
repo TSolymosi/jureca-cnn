@@ -1,0 +1,8 @@
+data_dir: /p/scratch/pasta/CNN/17.03.25/Processed_Data/processed_data
+lr: 3e-4
+weight_decay: 1e-5
+scheduler:
+  mode: min
+  patience: 5
+  factor: 0.2
+  min_lr: 1e-4

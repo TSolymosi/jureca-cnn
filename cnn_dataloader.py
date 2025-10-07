@@ -2,7 +2,8 @@
 
 import torch
 import torch.utils.data as data
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data.distributed import DistributedSampler # DDP Import
 from astropy.io import fits
 import os
 import re
@@ -42,7 +43,6 @@ def normalize(data, method='minmax'):
 
 
 class FitsDataset(data.Dataset):
-    print("+++ FitsDataset class body executed +++")
 
     def __init__(
         self,
@@ -64,13 +64,16 @@ class FitsDataset(data.Dataset):
         add_noise_level=0.0, # The stddev of noise to add. 0.0 means no noise.
         snr_threshold=5.0,   # The minimum SNR required after adding noise.
         mask_13co=True,      # A flag to enable/disable the masking feature.
+
+        rank=0,              # For DDP, the rank of this process
     ):
         
         
         self.wavelength_stride = wavelength_stride
         self.load_preprocessed = load_preprocessed
         self.file_list = file_list
-        print("=== FitsDataset constructor entered ===")
+        if rank == 0:
+            print("=== FitsDataset constructor entered ===")
         
 
         self.scaler_means = None
@@ -652,7 +655,7 @@ def get_dataloaders(batch_size):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=128, pin_memory=False, persistent_workers=True)
     return train_loader, test_loader
 """
-def create_dataloaders(
+def create_dataloaders_old(
     fits_dir,
     original_file_list_path=None,
     scaling_params_path=None,
@@ -674,7 +677,8 @@ def create_dataloaders(
     cauchy_threshold=0.07,
     add_noise_level=0.0,
     snr_threshold=5.0,
-    mask_13co=True
+    mask_13co=True,
+    rank = 0, # For DDP, the rank of this process
 ):
     # Load file list if given
     file_list = None
@@ -698,7 +702,8 @@ def create_dataloaders(
         cauchy_threshold=cauchy_threshold,
         add_noise_level=add_noise_level,
         snr_threshold=snr_threshold,
-        mask_13co=mask_13co,
+        mask_13co=mask_13co, 
+        rank = rank,
 
     )
     print(f"Creating subset and train/test split with seed {seed}...")
@@ -776,6 +781,168 @@ def create_dataloaders(
     
 
     return train_loader, test_loader, original_dataset_ref
+
+
+def create_dataloaders(
+    fits_dir,
+    # DDP CHANGE: Add arguments to know the DDP state
+    use_ddp=False,
+    rank=0,
+    world_size=1,
+    seed=42, # Add a seed for reproducibility
+    # --- Unchanged Arguments ---
+    original_file_list_path=None,
+    scaling_params_path=None,
+    wavelength_stride=1,
+    load_preprocessed=False,
+    preprocessed_dir=None,
+    use_local_nvme=False,
+    batch_size=16,
+    num_workers=32,
+    model_params=["Dens", "Lum", "radius", "prho"],
+    log_scale_params=["Dens", "Lum"],
+    data_subset_fraction=1.0,
+    # --- NOISE + MASKING ARGUMENTS ---
+    use_cauchy_noise=False,
+    cauchy_mu=0.003,
+    cauchy_sigma=0.0032,
+    cauchy_threshold=0.07,
+    add_noise_level=0.0,
+    snr_threshold=5.0,
+    mask_13co=True
+):
+    # DDP CHANGE: Guard print statements to only execute on the main process
+    is_main_process = (rank == 0)
+
+    # DDP CHANGE: Set the seed at the beginning to ensure all processes
+    # perform the exact same random operations (subsetting, train/test split).
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    file_list = None
+    if original_file_list_path and os.path.exists(original_file_list_path):
+        with open(original_file_list_path, 'r') as f:
+            file_list = [line.strip() for line in f if line.strip()]
+
+    if is_main_process:
+        print(f"Creating dataset")
+    
+    # Dataset creation is the same on all processes
+    dataset = FitsDataset(
+        fits_dir=fits_dir,
+        file_list=file_list,
+        wavelength_stride=wavelength_stride,
+        use_local_nvme=use_local_nvme,
+        load_preprocessed=load_preprocessed,
+        preprocessed_dir=preprocessed_dir or fits_dir,
+        model_params=model_params,
+        log_scale_params=log_scale_params,
+        use_cauchy_noise=use_cauchy_noise,
+        cauchy_mu=cauchy_mu,
+        cauchy_sigma=cauchy_sigma,
+        cauchy_threshold=cauchy_threshold,
+        add_noise_level=add_noise_level,
+        snr_threshold=snr_threshold,
+        mask_13co=mask_13co,
+        rank = rank,
+    )
+    
+    if is_main_process:
+        print(f"Creating subset and train/test split with seed {seed}...")
+        
+    if data_subset_fraction < 1.0:
+        if is_main_process:
+            print(f"Selecting a {data_subset_fraction * 100:.0f}% random subset of the data.")
+        num_samples_to_keep = int(len(dataset) * data_subset_fraction)
+        indices_to_keep = np.random.choice(len(dataset), num_samples_to_keep, replace=False)
+        dataset = Subset(dataset, indices_to_keep)
+        if is_main_process:
+            print(f"New dataset size after subset selection: {len(dataset)}")
+
+    # Because the seed is set, this split will be identical on all processes
+    dataset_size = len(dataset)
+    train_size = int(0.8 * dataset_size)
+    test_size = dataset_size - train_size
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+    # --- Scaling Parameter Logic (Main Process Only) ---
+    original_dataset_ref = dataset.dataset if isinstance(dataset, Subset) else dataset
+    
+    if scaling_params_path and os.path.exists(scaling_params_path):
+        if is_main_process:
+            print(f"Loading scaling parameters from: {scaling_params_path}")
+        scaling = torch.load(scaling_params_path)
+        original_dataset_ref.set_scaling_params(scaling['means'], scaling['stds'])
+    else:
+        if is_main_process:
+            print("Calculating scaling parameters...")
+            train_indices = train_dataset.indices
+            means, stds = calculate_label_scaling(dataset, train_indices)
+            original_dataset_ref.set_scaling_params(means, stds)
+            
+            print("Scaling parameters (means and stds):")
+            for i, param in enumerate(original_dataset_ref.model_params):
+                print(f"  {param}: mean = {means[i]:.4f}, std = {stds[i]:.4f}")
+
+            # DDP CHANGE: Only the main process saves the file
+            scaling_dict = {"means": means, "stds": stds}
+            slurm_id = os.environ.get("SLURM_JOB_ID", "nojob")
+            save_dir = f"Parameters/{slurm_id}/"
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "label_scaling.pt")
+            print(f"Saving scaling parameters to: {save_path}")
+            torch.save(scaling_dict, save_path)
+
+    # DDP CHANGE: All processes must wait here until the main process has finished
+    # calculating and saving the scaling parameters. This prevents other processes
+    # from trying to read a file that doesn't exist yet.
+    if use_ddp:
+        torch.distributed.barrier()
+        # After the barrier, if scaling params were calculated, non-main processes
+        # must load them to be in sync.
+        if not (scaling_params_path and os.path.exists(scaling_params_path)):
+            slurm_id = os.environ.get("SLURM_JOB_ID", "nojob")
+            load_path = f"Parameters/{slurm_id}/label_scaling.pt"
+            scaling = torch.load(load_path, weights_only = True)
+            original_dataset_ref.set_scaling_params(scaling['means'], scaling['stds'])
+
+
+    # --- DDP Sampler and DataLoader Creation ---
+    train_sampler = None
+    shuffle_train = True
+    if use_ddp:
+        # Create the DistributedSampler for the training dataset
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed, drop_last=True,
+        )
+        # The sampler handles shuffling, so the DataLoader's shuffle must be False
+        shuffle_train = False
+
+    # The test set is typically not sampled in a distributed manner.
+    # Evaluation is done on the full test set on the main process.
+    test_sampler = None 
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle_train,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False, # Test loader is never shuffled
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
+    )
+
+    return train_loader, test_loader, original_dataset_ref, train_sampler
 
 
 

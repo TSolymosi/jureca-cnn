@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=data_stage_sleep
-#SBATCH --output=slurm_output/sleeper_dcp_%j.out
-#SBATCH --error=slurm_output/sleeper_dcp_%j.err
+#SBATCH --output=slurm_output/sleeper/sleeper_dcp_%j.out
+#SBATCH --error=slurm_output/sleeper/sleeper_dcp_%j.err
 #SBATCH --partition=dc-hwai
 #SBATCH --account=westai0043
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=8  # Allocate enough CPUs for the eventual Python run
-#SBATCH --mem=256G         # Allocate enough memory
+#SBATCH --mem=128G         # Allocate enough memory
 #SBATCH --gres=gpu:4       # Allocate GPU
 #SBATCH --time=24:00:00    # Long enough for copy + debugging
 
@@ -154,11 +154,14 @@ echo "--- Data Staging Complete. Job is now sleeping. ---"
 echo "To run your script, use:"
 echo "srun --jobid=$SLURM_JOB_ID --cpu-bind=none --ntasks=1 --cpus-per-task=<CPUs_for_Python> python /path/to/CNN_implementation.py --data-dir ${NODE_LOCAL_DIR} ..."
 echo "Or alternatively"
-echo "bash run_CNN_sleep_multheads.sh --job_id $SLURM_JOB_ID"
+echo "bash run_CNN_hydra.sh --job_id $SLURM_JOB_ID"
 echo "(Remember to scancel $SLURM_JOB_ID when finished)"
 
 # Sleep indefinitely (or for a very long time)
 sleep infinity
+#echo "Sleeping for 6 hours..."
+#sleep 21600  # Sleep for 6 hours
+
 # Alternatively: sleep 86400 # Sleep for 24 hours
 
 echo "--- Sleep finished (or job terminated) ---"
