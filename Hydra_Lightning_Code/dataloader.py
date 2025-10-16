@@ -211,7 +211,7 @@ class FitsDataset(data.Dataset):
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-    def extract_label(self, filename):
+    def extract_label_old(self, filename):
         pattern = r'([A-Za-z0-9_]+)=([-\d.eE+]+)'
         matches = re.findall(pattern, filename)
         label_dict = {k.strip("_").replace("LTE_", ""): float(v) for k, v in matches}
@@ -223,6 +223,118 @@ class FitsDataset(data.Dataset):
             else:
                 label.append(label_dict[param])
         return label
+    
+    def extract_label(self, filename):
+        """
+        Extract labels from FITS header instead of filename.
+        
+        Maps FITS header keys to model parameter names.
+        """
+        # Mapping from model parameter names to FITS header keys
+        header_key_map = {
+            'M': 'mass',           # New parameter!
+            'D': 'dens',
+            'L': 'lum',
+            'ro': 'ro',
+            'p': 'prho',
+            'Tlow': 'Tlow',
+            'NCH3CN': 'abunch3cn',
+            'plummer_shape': None  # Computed from p and ro (not rr anymore!)
+        }
+        
+        # Get full path to FITS file
+        fits_path = filename if os.path.isabs(filename) else os.path.join(self.fits_dir, filename)
+        
+        # Read FITS header
+        try:
+            with fits.open(fits_path, memmap=True) as hdul:
+                header = hdul[0].header
+                
+                # Extract thermal_params from COMMENT section
+                # The header stores parameters as JSON in COMMENT cards
+                thermal_params = self._extract_thermal_params_from_header(header)
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to read header from {filename}: {e}")
+            raise
+        
+        # Build label array
+        label = []
+        for param in self.model_params:
+            if param == "plummer_shape":
+                # Compute plummer_shape = p * log10(ro)
+                # Note: Changed from p * log10(rr) to p * log10(ro)
+                p_val = thermal_params.get('prho', thermal_params.get('p'))
+                ro_val = thermal_params.get('ro')
+                if p_val is None or ro_val is None:
+                    raise ValueError(f"Cannot compute plummer_shape: missing p or ro in {filename}")
+                label.append(p_val * np.log10(ro_val))
+            else:
+                # Look up parameter in thermal_params
+                header_key = header_key_map.get(param)
+                if header_key is None:
+                    raise ValueError(f"Unknown parameter: {param}")
+                
+                value = thermal_params.get(header_key)
+                if value is None:
+                    raise ValueError(f"Parameter {param} (header key: {header_key}) not found in {filename}")
+                
+                label.append(float(value))
+        
+        return label
+
+    def _extract_thermal_params_from_header(self, header):
+        """
+        Extract parameters from FITS header COMMENT section.
+        
+        The header contains a JSON-like structure in COMMENT cards.
+        We need to parse it to extract thermal_params.
+        """
+        # Collect all COMMENT cards
+        comments = []
+        for card in header.cards:
+            if card.keyword == 'COMMENT':
+                comments.append(card.value)
+        
+        # Join into single string
+        comment_text = ' '.join(comments)
+        
+        # Try to parse as JSON
+        # The header has: COMMENT { ... COMMENT     "mass": 10.01467, ... COMMENT }
+        try:
+            import json
+            import re
+            
+            # Extract the JSON block between outermost braces
+            # Remove "COMMENT" prefixes that might be embedded
+            json_text = re.search(r'\{.*\}', comment_text, re.DOTALL)
+            if json_text:
+                json_str = json_text.group(0)
+                # Parse JSON
+                params = json.loads(json_str)
+                
+                # If thermal_params is nested, extract it
+                if 'thermal_params' in params:
+                    return params['thermal_params']
+                else:
+                    return params
+            else:
+                raise ValueError("Could not find JSON structure in COMMENT")
+        
+        except Exception as e:
+            print(f"[WARNING] Failed to parse thermal_params from header: {e}")
+            
+            # Fallback: Parse individual lines
+            # Look for patterns like: COMMENT     "mass": 10.01467,
+            params = {}
+            for comment in comments:
+                match = re.search(r'"(\w+)":\s*([\d.e+-]+)', comment)
+                if match:
+                    key = match.group(1)
+                    value = float(match.group(2))
+                    params[key] = value
+            
+            return params
 
     def set_scaling_params(self, means, stds):
         self.scaler_means, self.scaler_stds = means, stds
@@ -252,12 +364,12 @@ class FitsDataset(data.Dataset):
 
         return original
 
-    def inverse_transform_labels_with_uncertainty(self, scaled_mu, scaled_sigma):
+    def inverse_transform_labels_with_uncertainty_logspace(self, scaled_mu, scaled_sigma):
         """
-        Inverse transform predicted means and uncertainties back to original units.
+        Returns log-scale parameters in LOG SPACE for z-score calculations.
+        This is the ONLY correct way to calculate z-scores.
         """
         if self.scaler_means is None or self.scaler_stds is None:
-            print("[WARNING] inverse_transform_labels_with_uncertainty called without scaler parameters.")
             return scaled_mu, scaled_sigma
 
         means, stds = self.scaler_means, self.scaler_stds
@@ -269,19 +381,49 @@ class FitsDataset(data.Dataset):
 
         scaled_mu, scaled_sigma = scaled_mu.to(means.device), scaled_sigma.to(means.device)
 
+        # Simply undo z-score normalization - stay in log space
         unscaled_mu = scaled_mu * stds + means
         unscaled_sigma = scaled_sigma * stds
+        
+        return unscaled_mu, unscaled_sigma
+
+    def inverse_transform_labels_with_uncertainty(self, scaled_mu, scaled_sigma):
+        if self.scaler_means is None or self.scaler_stds is None:
+            return scaled_mu, scaled_sigma
+
+        means, stds = self.scaler_means, self.scaler_stds
+        
+        if not isinstance(scaled_mu, torch.Tensor):
+            scaled_mu = torch.from_numpy(scaled_mu)
+        if not isinstance(scaled_sigma, torch.Tensor):
+            scaled_sigma = torch.from_numpy(scaled_sigma)
+
+        scaled_mu, scaled_sigma = scaled_mu.to(means.device), scaled_sigma.to(means.device)
+
+        # First undo z-score normalization
+        unscaled_mu = scaled_mu * stds + means
+        unscaled_sigma = scaled_sigma * stds  # This is correct
 
         mu_orig, sigma_orig = unscaled_mu.clone(), unscaled_sigma.clone()
 
+        # FIXED: Correct uncertainty propagation for log-transformed parameters
         for idx in self.param_indices_to_log:
-            mu_log, sigma_log = unscaled_mu[:, idx], unscaled_sigma[:, idx]
-            upper, lower = torch.pow(10.0, mu_log + sigma_log), torch.pow(10.0, mu_log - sigma_log)
-            mu_orig[:, idx] = torch.pow(10.0, mu_log)
-            sigma_orig[:, idx] = (upper - lower) / 2.0
+            mu_log = unscaled_mu[:, idx]      # This is log10(value)
+            sigma_log = unscaled_sigma[:, idx] # This is σ in log-space
+            
+            # Convert log-space mean to linear space
+            mu_linear = torch.pow(10.0, mu_log)
+            
+            # Correct uncertainty propagation:
+            # For y = 10^x, dy/dx = y * ln(10)
+            # So σ_linear ≈ |y * ln(10)| * σ_log
+            sigma_linear = torch.abs(mu_linear * np.log(10)) * sigma_log
+            
+            mu_orig[:, idx] = mu_linear
+            sigma_orig[:, idx] = sigma_linear
 
         return mu_orig, sigma_orig
-
+    
     def get_frequency_axis(self):
         """
         Computes and returns the frequency axis for the dataset.

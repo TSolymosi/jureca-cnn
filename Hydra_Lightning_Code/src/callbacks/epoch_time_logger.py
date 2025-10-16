@@ -43,7 +43,7 @@ class EpochTimeLogger(Callback):
 
         if val_loss is not None:
             # Print the final validation loss for the epoch.
-            print(f"[Metrics] Epoch {trainer.current_epoch}: val/loss = {val_loss:.5f}", flush=True)
+            print(f"[Metrics] Epoch {trainer.current_epoch+1}: val/loss = {val_loss:.5f}", flush=True)
         else:
             # This can happen if validation is skipped or if the metric has a different name.
-            print(f"[Metrics] Epoch {trainer.current_epoch}: val/loss not found in callback_metrics.", flush=True)
+            print(f"[Metrics] Epoch {trainer.current_epoch+1}: val/loss not found in callback_metrics.", flush=True)

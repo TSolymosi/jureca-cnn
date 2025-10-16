@@ -1,11 +1,4 @@
-model_checkpoint:
-  _target_: lightning.pytorch.callbacks.ModelCheckpoint
-  monitor: val/loss
-  mode: min
-  save_top_k: 1
-  save_last: true
-  dirpath: ${outputs_dir}/checkpoints
-  filename: "epoch{epoch:02d}-valloss{val/loss:.2f}"
+
 
 early_stopping:
   _target_: lightning.pytorch.callbacks.EarlyStopping
@@ -36,14 +29,37 @@ diagnostic_plot:
 
 
 corner_plots:
-      _target_: src.callbacks.hybrid_corner_plot_callback.HybridCornerPlotCallback
-      param_names: ${data.model_params}
-      log_scale_params: ${data.log_scale_params}
-      output_dir: ${outputs_dir}/corner_plots
-      plot_every_n_epochs: 5         # Plot every 5 epochs
-      num_samples_to_plot: 10      # Plot the first 10 validation samples
-      num_posterior_samples: 5000  # Number of points for the plot's histograms/scatter
-      plot_in_log_space: true
+  _target_: src.callbacks.hybrid_corner_plot_callback.HybridCornerPlotCallback
+  param_names: ${data.model_params}
+  log_scale_params: ${data.log_scale_params}
+  output_dir: "${outputs_dir}/corner_plots"
+  plot_every_n_epochs: 5
+  num_samples_to_plot: 10
+  num_posterior_samples: 5000
+  plot_in_physical_space: true  # ← Set to true for physical space (default)
+  seed: 42
+
+
+calibration_check:
+  _target_: src.callbacks.calibration_check_callback.CalibrationCheckCallback
+  model_params: ${data.model_params}
+  log_scale_params: ${data.log_scale_params}
+  output_dir: "${outputs_dir}/calibration_check"
+  check_every_n_epochs: 5  # Check every 5 epochs
+
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: "${outputs_dir}/checkpoints"  # Uses Hydra's output path
+  filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+  monitor: "val/loss"
+  mode: "min"
+  save_last: true  # Critical: saves 'last.ckpt' for easy resume
+  save_top_k: 3    # Keep best 3 checkpoints
+  every_n_epochs: 1  # Save every epoch (or increase to save less often)
+  verbose: true
+  auto_insert_metric_name: false
+
+
 
 #debug:
 #  _target_: src.callbacks.debug.DataloaderDebugCallback

@@ -129,12 +129,17 @@ class CovarianceHead(nn.Module):
     A head designed to predict a full covariance matrix by predicting its Cholesky factor, L.
     This is the key component for enabling corner plots.
     For a d-dimensional output, it predicts the d*(d+1)/2 unique elements of the lower-triangular L matrix.
+    
+    FIXED: Now initializes with proper diagonal scale to prevent suppressed uncertainties.
     """
-    def __init__(self, input_dim: int, d: int, num_components: int = 1, jitter: float = 1e-6):
+    def __init__(self, input_dim: int, d: int, num_components: int = 1, jitter: float = 1e-6, 
+                 init_diag_scale: float = 1.0, per_param_scales: dict = None):
         super().__init__()
         self.d = d # The number of target parameters (dimensionality).
         self.K = int(num_components)
         self.jitter = float(jitter) # A small value to add to the diagonal for stability.
+        self.init_diag_scale = float(init_diag_scale)
+        self.per_param_scales = per_param_scales or {}  # Dict mapping param index to scale
 
         # Calculate the number of elements in a lower-triangular d x d matrix.
         packed_elements = d * (d + 1) // 2
@@ -142,6 +147,36 @@ class CovarianceHead(nn.Module):
         # The output dimension of the linear layer is the number of elements to predict.
         out_dim = packed_elements if self.K == 1 else self.K * packed_elements
         self.L_params = nn.Linear(input_dim, out_dim)
+        
+        # CRITICAL FIX: Initialize the bias to encourage reasonable initial uncertainties
+        # For diagonal elements (which control the scale), initialize to positive values
+        with torch.no_grad():
+            # Create indices for diagonal element positions in the packed lower-triangular format
+            # For a 7x7 matrix (your 7 parameters), diagonal elements are at positions:
+            # i=0: pos 0, i=1: pos 2, i=2: pos 5, i=3: pos 9, i=4: pos 14, i=5: pos 20, i=6: pos 27
+            # Pattern: position = i*(i+1)/2 + i = i*(i+3)/2
+            diag_indices = []
+            idx = 0
+            for i in range(d):
+                diag_indices.append(idx)
+                idx += (i + 2)  # Move to next diagonal: skip (i+1) off-diagonal elements + 1 for next row start
+            
+            # For each mixture component, initialize diagonal biases
+            if self.K == 1:
+                for param_idx, diag_idx in enumerate(diag_indices):
+                    # Use per-parameter scale if provided, otherwise use default
+                    scale = self.per_param_scales.get(param_idx, self.init_diag_scale)
+                    self.L_params.bias[diag_idx] = scale
+            else:
+                for k in range(self.K):
+                    offset = k * packed_elements
+                    for param_idx, diag_idx in enumerate(diag_indices):
+                        scale = self.per_param_scales.get(param_idx, self.init_diag_scale)
+                        # Scale up uncertainty for non-primary components
+                        if k > 0:
+                            scale *= (1.5 + 0.3 * k)
+                        self.L_params.bias[offset + diag_idx] = scale
+        
         self.softplus = nn.Softplus()
 
     def forward(self, feats: torch.Tensor):
@@ -336,7 +371,20 @@ class Spectral2DResNet(nn.Module):
 
         # If using full covariance MDN, create the dedicated covariance head.
         if self.use_mdn and self.covariance_type == "full":
-            self.cov_head = CovarianceHead(fc_hidden_dim, n_outputs, num_components=self.num_mixtures)
+            self.cov_head = CovarianceHead(
+                fc_hidden_dim, n_outputs, 
+                num_components=self.num_mixtures,
+                init_diag_scale=1.0,
+                per_param_scales = {
+                    0: 2.0,   # D
+                    1: 3.0,   # L - CRITICAL: needs larger initial scale
+                    2: 1.0,   # ro
+                    3: 1.0,   # rr
+                    4: 1.0,   # p
+                    5: 1.0,   # Tlow
+                    6: 2.0,   # NCH3CN
+                }
+            )
 
         # If using a mixture of Gaussians (K>1), create a head to predict the mixture weights (pi).
         if self.use_mdn and self.num_mixtures > 1:

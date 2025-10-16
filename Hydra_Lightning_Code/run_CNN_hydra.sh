@@ -36,6 +36,11 @@ LOG_FILE="${LOG_DIR}/hydra_run_${JOB_ID}.log"
 
 mkdir -p "${LOG_DIR}"
 : > "${LOG_FILE}"
+# Redirect ALL subsequent output to both terminal and log file
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+
+echo -e "\n\n==================== RUN STARTED: $(date '+%Y-%m-%d %H:%M:%S') ====================\n"
 
 # ------------------ Modules & Env ------------------
 export HYDRA_FULL_ERROR=1
@@ -70,11 +75,11 @@ ARGS=(
   "trainer.strategy=ddp"
   "trainer.devices=${GPUS_PER_NODE}"
   "trainer.num_nodes=${SLURM_NNODES}"
-  "trainer.max_epochs=100"
+  "trainer.max_epochs=215"
   "+job_id=${JOB_ID}"
   "data.use_cauchy_noise=True"
   "data.mask_13co=True"
-  "model.num_mixtures=1"
+  "model.num_mixtures=3"
   #"data.add_noise_level=0.0"
 )
 
