@@ -3,6 +3,7 @@ from lightning.pytorch.utilities import rank_zero_only
 from dataloader import create_dataloaders
 from dataloader import create_test_loader
 import os
+import shutil
 
 from contextlib import suppress
 import torch.distributed as dist
@@ -40,6 +41,7 @@ class FitsDataModule(LightningDataModule):
         self.log_scale_params     = data_cfg.log_scale_params
         self.data_subset_fraction = data_cfg.get("data_subset_fraction", 1.0)
         self.seed                 = data_cfg.get("seed", 42)
+        self.freeze_scalers_from  = data_cfg.get("freeze_scalers_from", None) # If set, we will restore these (training) scalers after PREP writes files/splits
         # Additional noise/masking parameters
         self.mask_13co            = data_cfg.get("mask_13co", True)
         self.use_cauchy_noise     = data_cfg.get("use_cauchy_noise", True)
@@ -86,6 +88,11 @@ class FitsDataModule(LightningDataModule):
             # add_noise_level=self.add_noise_level,
             # snr_threshold=self.snr_threshold,
         )
+        
+        if self.freeze_scalers_from:
+            os.makedirs(os.path.dirname(self.scaling_params_path), exist_ok=True)
+            shutil.copyfile(self.freeze_scalers_from, self.scaling_params_path)
+            print(f"[DEBUG] prepare_data: replaced scalers with training scalers from {self.freeze_scalers_from}", flush=True)
 
     def setup(self, stage=None):
         #print(f"[Rank {dist.get_rank()}] -> Entered setup")

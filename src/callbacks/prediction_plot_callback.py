@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.utilities import rank_zero_only
+import json
 
 
 class PredictionPlotCallback(Callback):
@@ -53,6 +54,38 @@ class PredictionPlotCallback(Callback):
         if L is None:
             return None
         return torch.sqrt((L ** 2).sum(dim=-1).clamp_min(1e-12))
+
+    # try to recover an ordered filename list matching the dataset order
+    def _get_filenames(self, ds, trainer, n_rows):
+        # 1) common attribute names on custom datasets
+        for attr in ("file_paths", "files", "paths", "file_list"):
+            if hasattr(ds, attr):
+                lst = getattr(ds, attr)
+                if isinstance(lst, (list, tuple)) and len(lst) > 0:
+                    return [os.path.basename(p) for p in lst[:n_rows]]
+
+        # 2) torch.utils.data.Subset wrapping a dataset with file_paths
+        if hasattr(ds, "dataset") and hasattr(ds, "indices"):
+            base = getattr(ds, "dataset")
+            idxs = list(getattr(ds, "indices"))
+            for attr in ("file_paths", "files", "paths", "file_list"):
+                if hasattr(base, attr):
+                    base_paths = getattr(base, attr)
+                    paths = [base_paths[i] for i in idxs[:n_rows]]
+                    return [os.path.basename(p) for p in paths]
+
+        # 3) fallback: load Parameters/<JOB_ID>/file_list.json (same one you write in PREP)
+        dm = getattr(trainer, "datamodule", None)
+        scalers_path = getattr(dm, "scaling_params_path", None)
+        if scalers_path:
+            fl_json = os.path.join(os.path.dirname(scalers_path), "file_list.json")
+            if os.path.exists(fl_json):
+                with open(fl_json, "r") as f:
+                    files = json.load(f)
+                return [os.path.basename(p) for p in files[:n_rows]]
+
+        # last resort: None -> we’ll skip adding the column
+        return None
 
     def _run_split(self, *, split, trainer, pl_module):
         pl_module.eval()
@@ -182,6 +215,13 @@ class PredictionPlotCallback(Callback):
                 df[f"pred_{param_name}"] = preds_np[:, i]
                 if sigmas_np is not None:
                     df[f"sigma_{param_name}"] = sigmas_np[:, i]
+
+            # prepend the filename column aligned with row order
+            filenames = self._get_filenames(ds, trainer, n_rows=len(df))
+            if filenames is not None and len(filenames) == len(df):
+                df.insert(0, "filename", filenames)
+            else:
+                print("[PredictionPlotCallback] WARNING: could not resolve filenames; CSV will omit them.", flush=True)
 
             csv_path = os.path.join(final_dir, "final_predictions.csv")
             df.to_csv(csv_path, index=False)

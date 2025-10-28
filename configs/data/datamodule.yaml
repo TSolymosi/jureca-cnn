@@ -21,3 +21,4 @@ cauchy_sigma: 0.0032
 cauchy_threshold: 0.07
 add_noise_level: 0.01
 snr_threshold: 5.0
+freeze_scalers_from: null
