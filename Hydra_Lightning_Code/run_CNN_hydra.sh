@@ -29,13 +29,13 @@ SCALING_PARAMS_PATH="/p/scratch/westai0043/CNN_HL_tobias/Parameters/${JOB_ID}/la
 NODE_LOCAL_DIR="/local/nvme/${JOB_ID}_fits_data"
 
 #VENV_PATH="/p/scratch/westai0043/CNN_timon/testing/sc_venv_template/venv/bin/activate"
-VENV_PATH="/p/project/pasta/jusuf-radmc/.radmc_venv_2024/bin/activate"
+VENV_PATH="/p/project1/pasta/jusuf-radmc/.radmc_venv_2024/bin/activate"
 SCRIPT_PATH="/p/scratch/westai0043/CNN_HL_tobias/src/train.py"
 LOG_DIR="slurm_output/cnn_run"
 LOG_FILE="${LOG_DIR}/hydra_run_${JOB_ID}.log"
 
 mkdir -p "${LOG_DIR}"
-: > "${LOG_FILE}"
+touch "${LOG_FILE}"
 # Redirect ALL subsequent output to both terminal and log file
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
@@ -53,6 +53,12 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 echo "Project Root: $PROJECT_ROOT"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
+# Specify matplotlib cache directory
+mkdir -p "${PROJECT_ROOT}/_pycache_/.matplotlib_cache"
+export MPLCONFIGDIR="${PROJECT_ROOT}/_pycache_/.matplotlib_cache"
+
+
+
 
 #module load Stages/2025 GCC PyTorch torchvision Python/3.12.3 || { echo 'Module load failed'; exit 1; }
 
@@ -63,19 +69,18 @@ ARGS=(
   "data.data_dir=${NODE_LOCAL_DIR}"
   #"data.model_params=[$(tr ' ' , <<<"${MODEL_PARAMS}")]"
   #"data.log_scale_params=[$(tr ' ' , <<<"${LOG_SCALE_PARAMS}")]"
-  "data.model_params=['D','L','ro','rr','p','Tlow','NCH3CN']" #, 'plummer_shape'
-  "data.log_scale_params=['D','L','NCH3CN']"
+  "data.model_params=['M', 'D','L','ro','p','Tlow','NCH3CN']" #, 'plummer_shape'
+  "data.log_scale_params=['M','D','L','NCH3CN']"
   "model.model_depth=18"
   "data.use_local_nvme=True"
   "data.batch_size=4"
   "data.num_workers=8"
-  "data.data_subset_fraction=1.0"
+  "data.data_subset_fraction=0.9995"
   "data.scaling_params_path=${SCALING_PARAMS_PATH}"
   "trainer.accelerator=gpu"
-  "trainer.strategy=ddp"
   "trainer.devices=${GPUS_PER_NODE}"
   "trainer.num_nodes=${SLURM_NNODES}"
-  "trainer.max_epochs=215"
+  "trainer.max_epochs=90"
   "+job_id=${JOB_ID}"
   "data.use_cauchy_noise=True"
   "data.mask_13co=True"
@@ -115,14 +120,14 @@ if [[ "$RUN_MODE" == "sweep" ]]; then
          --ntasks-per-node="${GPUS_PER_NODE}" \
          --gpus-per-task=1 \
          --cpus-per-task="${CPUS_FOR_PYTHON}" \
-         "${PYTHON_BIN}" "${SCRIPT_PATH}" -m "${ARGS[@]}" 2>&1 | tee -a "${LOG_FILE}"
+         "${PYTHON_BIN}" "${SCRIPT_PATH}" -m "${ARGS[@]}" #2>&1 | tee -a "${LOG_FILE}"
 else
     echo "[INFO] Launching single run..."
     srun --jobid="${JOB_ID}" --cpu-bind=none \
          --ntasks-per-node="${GPUS_PER_NODE}" \
          --gpus-per-task=1 \
          --cpus-per-task="${CPUS_FOR_PYTHON}" \
-         "${PYTHON_BIN}" "${SCRIPT_PATH}" "${ARGS[@]}" 2>&1 | tee -a "${LOG_FILE}"
+         "${PYTHON_BIN}" "${SCRIPT_PATH}" "${ARGS[@]}" #2>&1 | tee -a "${LOG_FILE}"
 fi
 
 exit $?

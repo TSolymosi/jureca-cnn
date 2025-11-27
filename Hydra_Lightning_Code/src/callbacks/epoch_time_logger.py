@@ -14,7 +14,7 @@ class EpochTimeLogger(Callback):
     @rank_zero_only
     def on_train_epoch_end(self, trainer, pl_module):
         self._epoch_time = time.perf_counter() - self._t0
-        print(f"[Epoch {trainer.current_epoch+1}] time={self._epoch_time:.2f}s", flush=True)
+        print(f"[Epoch {trainer.current_epoch}] time={self._epoch_time:.2f}s", flush=True)
 
     # if you want to print a metric, do it here instead (after val syncs)
     # @rank_zero_only
@@ -43,7 +43,7 @@ class EpochTimeLogger(Callback):
 
         if val_loss is not None:
             # Print the final validation loss for the epoch.
-            print(f"[Metrics] Epoch {trainer.current_epoch+1}: val/loss = {val_loss:.5f}", flush=True)
+            print(f"[Metrics] Epoch {trainer.current_epoch}: val/loss = {val_loss:.5f}", flush=True)
         else:
             # This can happen if validation is skipped or if the metric has a different name.
-            print(f"[Metrics] Epoch {trainer.current_epoch+1}: val/loss not found in callback_metrics.", flush=True)
+            print(f"[Metrics] Epoch {trainer.current_epoch}: val/loss not found in callback_metrics.", flush=True)

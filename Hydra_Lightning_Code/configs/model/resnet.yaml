@@ -15,3 +15,5 @@ num_mixtures: 1         # For MDN
 cov_diag_use_log: true
 cov_diag_targets: {D: 1.0, rr: 1.0}
 cov_diag_weights: {D: 0.05, rr: 0.05}
+covariance_mode: 'cholesky_symmetric'
+#fixed_mixture_weights: [0.6, 0.3, 0.1] # Overrides num_mixtures if set

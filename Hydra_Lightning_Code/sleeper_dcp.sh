@@ -25,7 +25,7 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 
 # --- Define Paths ---
-SRC="/p/scratch/pasta/production_run/Data_21.07.25_models_new_var"
+SRC="/p/scratch/pasta/production_run/Data_14.10.25_mass_models/"
 LIST="$(realpath arcsec_files.txt)"
 #ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
 NODE_LOCAL_DIR="/local/nvme/${SLURM_JOB_ID}_fits_data"
@@ -54,29 +54,7 @@ if [ ! -f "${COPY_DONE_FLAG}" ]; then
     echo "Command to be used: dcp -v -p -i List \"${TARGET_DIR_ARG}\""
     start_copy_time=$(date +%s)
 
-    #mkdir -p "$(dirname "$LIST")"
 
-
-    # Use find instead of dfind — and ensure relative paths for dcp
-    #find "$SRC" -type f -name "*arcsec.fits" | sed "s|^$SRC/||" > "$LIST"
-    #find "$SRC" -type f -name "*arcsec.fits" > "$LIST"
-
-    # Debug output
-    #echo "Generated list at $LIST with $(wc -l < "$LIST") entries"
-    #head "$LIST"
-
-    # Copy to a well-known shared file location all MPI ranks can access
-    #SHARED_LIST="/p/scratch/westai0043/CNN/arcsec_files.txt"
-    #cp "$LIST" "$SHARED_LIST"
-
-    # Confirm all ranks can read it
-    #ls -l "$SHARED_LIST"
-    #head "$SHARED_LIST"
-
-
-    #echo "Running dcp with the generated list..."
-    # Run dcp with the filtered list
-    #mpirun -np 8 dcp -v -p -i "$SHARED_LIST" "$SRC" "$TARGET_DIR_ARG"
     mpirun -np 8 dcp -v -p "$SRC" "$TARGET_DIR_ARG"
     
     dcp_exit_code=$?
@@ -93,50 +71,9 @@ if [ ! -f "${COPY_DONE_FLAG}" ]; then
     echo "Data copy finished via dcp in ${copy_duration} seconds."
 
     # --- Verification ---
-    echo "Running verification..."
-    # 1. Check total size
+    echo "Checking total disk usage on worker node"
+    # Check total size
     du -sh "${NODE_LOCAL_DIR}"
-
-    # 2. Basic structure check
-    #first_data_subdir_name=$(find "${ORIGINAL_FITS_SCRATCH_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'Dens=*' -print -quit | xargs basename)
-    #verification_passed=true
-    #if [ -n "$first_data_subdir_name" ]; then
-    #     if ! find "${NODE_LOCAL_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'Dens=*' -print -quit | grep -q .; then
-    #          echo "Error: Verification failed - No subdirectories matching 'Dens=*' found in ${NODE_LOCAL_DIR}."
-    #          verification_passed=false
-    #     else
-    #          echo "Verification: Found expected subdirectory pattern 'Dens=*'."
-    #     fi
-    #else
-    #    echo "Verification: No 'Dens=*' subdirectory found in source to verify against."
-    #fi
-
-    # 3. Count copied files
-    # We can't easily know the expected count without the text list,
-    # but we check that *some* files matching the pattern were copied.
-    #echo "Verifying copied file count..."
-    #copied_files_count=$(find "${NODE_LOCAL_DIR}" -type f -name "${FILE_PATTERN}" | wc -l)
-    #if [ "$copied_files_count" -eq 0 ]; then
-        # This implies dcp failed to copy anything despite a non-empty list
-    #    echo "Error: Verification failed - Copied file count in destination is 0, but dfind list was non-empty."
-    #    verification_passed=false
-    #else
-    #    echo "Verification: Found ${copied_files_count} copied '${FILE_PATTERN}' files in destination."
-        # If you generated the text list in Step 1, you could copy *that* list name here
-        # and uncomment the comparison logic if needed.
-        # PREGENERATED_TXT_LIST_PATH="${ORIGINAL_FITS_SCRATCH_DIR}/fits_file_list.txt"
-        # if [ -f "${PREGENERATED_TXT_LIST_PATH}" ]; then
-        #   expected_count=$(wc -l < "${PREGENERATED_TXT_LIST_PATH}")
-        #   if [ "$copied_files_count" -ne "$expected_count" ]; then ... error ... fi
-        # fi
-    #fi
-
-    #if [ "$verification_passed" = false ]; then
-    #    echo "Cleaning up failed verification in ${NODE_LOCAL_DIR}..."
-    #    rm -rf "${NODE_LOCAL_DIR}"
-    #    exit 1
-    #fi
-    # --- End Verification ---
 
 
     # Create flag file to indicate successful completion
@@ -151,6 +88,17 @@ fi
 
 
 echo "--- Data Staging Complete. Job is now sleeping. ---"
+
+# Notify the submitter terminal that the copy phase is done
+if [ -n "$SLURM_JOB_USER" ]; then
+    scontrol show job $SLURM_JOB_ID | grep -q "UserId=$SLURM_JOB_USER"
+    if [ $? -eq 0 ]; then
+        echo "Sending notification to terminal of user $SLURM_JOB_USER..."
+        echo -e "\n>>> [Job ${SLURM_JOB_ID}] Data copy completed successfully on $(hostname) <<<\n" | wall -n
+    fi
+fi
+
+
 echo "To run your script, use:"
 echo "srun --jobid=$SLURM_JOB_ID --cpu-bind=none --ntasks=1 --cpus-per-task=<CPUs_for_Python> python /path/to/CNN_implementation.py --data-dir ${NODE_LOCAL_DIR} ..."
 echo "Or alternatively"
@@ -159,8 +107,7 @@ echo "(Remember to scancel $SLURM_JOB_ID when finished)"
 
 # Sleep indefinitely (or for a very long time)
 sleep infinity
-#echo "Sleeping for 6 hours..."
-#sleep 21600  # Sleep for 6 hours
+
 
 # Alternatively: sleep 86400 # Sleep for 24 hours
 

@@ -1,4 +1,4 @@
 mode: min
 patience: 5
 factor: 0.2
-min_lr: 1e-4
+min_lr: 1e-6

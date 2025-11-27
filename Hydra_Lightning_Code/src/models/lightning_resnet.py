@@ -8,6 +8,7 @@ from typing import Optional, Dict, List, Tuple
 from contextlib import nullcontext
 import math
 import inspect
+import numpy as np
 
 # Assuming ResNet3D.py contains the model definition.
 # This import brings in the function responsible for creating the ResNet model architecture.
@@ -223,6 +224,7 @@ class LitResNetMDN(LightningModule):
     """
     def __init__(
         self, model_cfg, optim_cfg, training_cfg,
+        strategy_cfg,
         std_weights=None,
         dump_bad_batch: bool = True,
         dump_dir: str = "./",
@@ -240,6 +242,7 @@ class LitResNetMDN(LightningModule):
         # `save_hyperparameters` stores the arguments to __init__ in self.hparams,
         # which is useful for logging and model checkpointing.
         self.save_hyperparameters(logger=False)
+        self.is_stage_1 = True # Default state
 
         # We use a try-except because global_rank is only available after the Trainer starts.
         try:
@@ -247,22 +250,26 @@ class LitResNetMDN(LightningModule):
         except Exception:
             rank = "N/A (pre-init)"
             
-        print("\n" + "="*80)
-        print(f"DIAGNOSTICS FOR PROCESS RANK: {rank}")
+        # print("\n" + "="*80)
+        # print(f"DIAGNOSTICS FOR PROCESS RANK: {rank}")
         
-        # 1. Find out which file this class was actually loaded from.
-        class_file = inspect.getfile(self.__class__)
-        print(f"[INFO] The 'LitResNetMDN' class was loaded from file:\n       -> {class_file}")
+        # # 1. Find out which file this class was actually loaded from.
+        # class_file = inspect.getfile(self.__class__)
+        # print(f"[INFO] The 'LitResNetMDN' class was loaded from file:\n       -> {class_file}")
         
-        # 2. Inspect the signature of the on_validation_epoch_end method.
-        hook_method = self.on_validation_epoch_end
-        signature = inspect.getfullargspec(hook_method)
-        print(f"[INFO] Signature of 'on_validation_epoch_end' found:\n       -> args = {signature.args}")
-        print("="*80 + "\n", flush=True)
+        # # 2. Inspect the signature of the on_validation_epoch_end method.
+        # hook_method = self.on_validation_epoch_end
+        # signature = inspect.getfullargspec(hook_method)
+        # print(f"[INFO] Signature of 'on_validation_epoch_end' found:\n       -> args = {signature.args}")
+        # print("="*80 + "\n", flush=True)
         
 
         # --- Section 1: Model Setup ---
         self.config_name = self._get_config_name(model_cfg.model_depth)
+
+        # --- Handle fixed mixture weights ---
+        self.fixed_mixture_weights = model_cfg.get("fixed_mixture_weights", None)
+        
         self.model = generate_2d_model(
             config_name=self.config_name,
             use_batchnorm=model_cfg.use_batchnorm,
@@ -272,7 +279,9 @@ class LitResNetMDN(LightningModule):
             attention_latent_dim=model_cfg.attention_latent_dim,
             use_mdn=model_cfg.use_mdn,
             covariance_type=model_cfg.covariance_type,
-            num_mixtures=model_cfg.num_mixtures
+            num_mixtures=model_cfg.num_mixtures,
+            covariance_mode=model_cfg.get('covariance_mode', 'cholesky_symmetric'),
+            fixed_mixture_weights=self.fixed_mixture_weights,
         )
         self.model_params: List[str] = model_cfg.target_params
         self.use_mdn: bool = model_cfg.use_mdn
@@ -313,6 +322,11 @@ class LitResNetMDN(LightningModule):
         self.aug_add_gauss_sigma = add_gauss_sigma
         self.aug_mask_frac = mask_frac
         self.aug_mask_mode = mask_mode
+
+        # --- Section 5: Two-Stage Training Setup ---
+        self.is_stage_1 = True # Default to Stage 
+    
+    
 
 
     # ------------------- Lightning Lifecycle Hooks -------------------
@@ -360,177 +374,256 @@ class LitResNetMDN(LightningModule):
             print(f"[INFO] Using data augmentation (noise) only on training data: {self.apply_aug_train_only}", flush=True)
 
     
+    # In LitResNetMDN.py
+
     def training_step(self, batch, batch_idx):
-        """
-        The main training loop for a single batch.
-        FIXED: Proper component-wise regularization for mixtures.
-        """
-        # 1. Unpack data and move to the correct device.
-        x, y, _ = self._split_batch(batch)
-        x = x.to(self.device, non_blocking=True)
-        y = y.to(self.device, non_blocking=True)
+            """
+            The main training loop for a single batch.
+            FIXED: Proper component-wise regularization for mixtures.
+            """
+            # 1. Unpack data and move to the correct device.
+            x, y, _ = self._split_batch(batch)
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
 
-        # 2. Apply on-the-fly GPU augmentations.
-        x = self._maybe_augment_on_device(x)
+            # 2. Apply on-the-fly GPU augmentations.
+            x = self._maybe_augment_on_device(x)
 
-        # 3. Perform sanity checks on the data.
-        self._sanity_checks(x, y, batch_idx)
+            # 3. Perform sanity checks on the data.
+            self._sanity_checks(x, y, batch_idx)
 
-        # 4. Forward pass, using mixed precision if enabled.
-        use_amp = x.is_cuda and "mixed" in str(getattr(self.trainer, "precision", ""))
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            out = self(x)
+            # 4. Forward pass, using mixed precision if enabled.
+            use_amp = x.is_cuda and "mixed" in str(getattr(self.trainer, "precision", ""))
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                out = self(x)
+            
+            # --- START: TWO-STAGE LOSS LOGIC ---
+            # Get the configured switch epoch from hparams, default to a large number if not specified
+            # Read from the new hparams location
+            switch_epoch = self.hparams.strategy_cfg.get("two_stage_training", {}).get("switch_epoch", 9999)
 
-        # 5. Calculate loss based on the model's output structure.
-
-        # --- PATH 1: Mixture of Gaussians (MoG) with Full Covariance ---
-        if isinstance(out, dict) and ("pi_logits" in out) and ("L" in out):
-            # Full covariance mixture
-            loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
-            
-            # --- CRITICAL FIX: Regularize COMPONENT sigmas, not marginal ---
-            L_all = out["L"]  # Shape: [B, K, d, d]
-            K = L_all.shape[1]
-            
-            # Calculate sigma for each component: [B, K, d]
-            sigma_components = torch.sqrt((L_all.float().square()).sum(dim=-1))
-            
-            # STRATEGY: Use TWO types of regularization
-            # 1. Soft pull towards target=1.0 for all (weak, uniform)
-            # 2. Hard penalty for collapse below threshold (strong, selective)
-            
-            # --- Part 1: Soft regularization towards unit variance ---
-            target_sigma = 0.5
-            soft_reg_weight = 0.0  # Disabled
-            sigma_reg_loss = soft_reg_weight * ((sigma_components - target_sigma) ** 2).mean()
-            
-            # --- Part 2: Anti-collapse penalty (only for small sigmas) ---
-            # This ONLY activates when sigmas get dangerously small
-            min_sigma_threshold = 0.15  # Lower threshold - more lenient
-            violation = torch.clamp(min_sigma_threshold - sigma_components, min=0.0)
-            
-            # Per-parameter penalty weights - boost only problematic params
-            param_penalties = torch.zeros(len(self.model_params), device=self.device)
-            name2idx = {n: i for i, n in enumerate(self.model_params)}
-            if 'D' in name2idx:
-                param_penalties[name2idx['D']] = 5.0  # Strong for D
-            # Don't boost L - it's fine now
-            
-            # Apply penalty: strong for violations, zero otherwise
-            weighted_violation = violation * param_penalties.view(1, 1, -1)
-            min_sigma_penalty = 10.0 * (weighted_violation ** 2).mean()
-            
-            total_loss = loss + sigma_reg_loss + min_sigma_penalty
-            
-            # Log for monitoring
-            if batch_idx == 0 and self.trainer.is_global_zero:
-                print(f"\n[Batch 0 Check - Epoch {self.current_epoch}]")
-                for i, name in enumerate(self.model_params):
-                    # Average sigma across batch and components
-                    avg_sigma = sigma_components[:, :, i].mean().item()
-                    min_sigma = sigma_components[:, :, i].min().item()
-                    max_sigma = sigma_components[:, :, i].max().item()
-                    print(f"  {name}: avg_sigma={avg_sigma:.3f}, min={min_sigma:.3f}, max={max_sigma:.3f}")
-            
-            if batch_idx == 0 and self.trainer.is_global_zero:
-                print(f"\n[Batch 0 Check - Epoch {self.current_epoch}]")
+            if self.is_stage_1:
+                # --- STAGE 1: Train means and mixture weights only ---
                 
-                # Print mixture weight distribution
-                if isinstance(out, dict) and "pi_logits" in out:
-                    pi = torch.softmax(out["pi_logits"], dim=-1)  # [B, K]
-                    print(f"  Mixture weights (mean across batch):")
-                    for k in range(pi.shape[1]):
-                        avg_weight = pi[:, k].mean().item()
-                        print(f"    Component {k+1}: {avg_weight:.1%}")
-            
-            self.log("train/loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/nll", loss, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/sigma_reg", sigma_reg_loss, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/min_sigma_penalty", min_sigma_penalty, on_step=False, on_epoch=True, sync_dist=True)
-            return total_loss
-        
-        # --- PATH 2: Mixture of Gaussians (MoG) with Diagonal Covariance ---
-        if isinstance(out, dict) and ("pi_logits" in out) and ("sigma" in out):
-            # Diagonal covariance mixture
-            loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
-            
-            # Similar regularization for diagonal case
-            sigma_all = out["sigma"]  # Shape: [B, K, d]
-            target_sigma = 1.0
-            reg_weight = 1.0
-            
-            # Per-parameter weighting
-            param_weights = torch.ones(len(self.model_params), device=self.device)
-            name2idx = {n: i for i, n in enumerate(self.model_params)}
-            if 'D' in name2idx:
-                param_weights[name2idx['D']] = 3.0
-            if 'L' in name2idx:
-                param_weights[name2idx['L']] = 2.0
-            
-            sigma_diff = (sigma_all - target_sigma) ** 2
-            weighted_diff = sigma_diff * param_weights.view(1, 1, -1)
-            sigma_reg_loss = reg_weight * weighted_diff.mean()
-            
-            # Minimum sigma constraint
-            min_sigma_threshold = 0.2
-            violation = torch.clamp(min_sigma_threshold - sigma_all, min=0.0)
-            min_sigma_penalty = 10.0 * (violation ** 2).mean()
-            
-            total_loss = loss + sigma_reg_loss + min_sigma_penalty
-            
-            if batch_idx == 0 and self.trainer.is_global_zero:
-                print(f"\n[Batch 0 Check - Epoch {self.current_epoch}]")
-                for i, name in enumerate(self.model_params):
-                    avg_sigma = sigma_all[:, :, i].mean().item()
-                    min_sigma = sigma_all[:, :, i].min().item()
-                    max_sigma = sigma_all[:, :, i].max().item()
-                    print(f"  {name}: avg_sigma={avg_sigma:.3f}, min={min_sigma:.3f}, max={max_sigma:.3f}")
-            
-            self.log("train/loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/nll", loss, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/sigma_reg", sigma_reg_loss, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/min_sigma_penalty", min_sigma_penalty, on_step=False, on_epoch=True, sync_dist=True)
-            return total_loss
+                # Find the "best" component for each data point using the mixture weights
+                pi_weights = F.softmax(out["pi_logits"], dim=-1) # [B, K]
+                # Use Gumbel-Softmax as a differentiable replacement for argmax.
+                # `hard=True` makes the forward pass output a one-hot vector [0., 1., 0.],
+                # but the backward pass is fully differentiable.
+                # `tau` is the temperature; a value of 1.0 is a good starting point.
+                best_component_one_hot = F.gumbel_softmax(out["pi_logits"], tau=1.0, hard=True, dim=-1) # Shape: [B, K]
+                
+                # Use the one-hot vector to select the best mean for each sample.
+                # This is a differentiable way to perform the selection.
+                # out["mu"] has shape [B, K, d]. best_component_one_hot.unsqueeze(-1) has shape [B, K, 1].
+                # The multiplication zeros out the non-selected components. The sum collapses the K dimension.
+                best_mu = (out["mu"] * best_component_one_hot.unsqueeze(-1)).sum(dim=1) # Shape: [B, d]
+                
+                # Use a simple MSE loss on the means of the most likely components.
+                # This forces the means to go to the right place and the mixture weights
+                # to correctly identify the best component, without involving the covariance.
+                total_loss = F.mse_loss(best_mu, y)
+                
+                # --- STAGE 1 DIAGNOSTIC LOGGING ---
+                if batch_idx == 0 and self.trainer.is_global_zero:
+                    print(f"\n==================== [STAGE 1 - Epoch {self.current_epoch}] ====================")
+                    print(f"    Proxy Loss (MSE on best mean): {total_loss.item():.4f}")
+                    
+                    # Print mixture weight distribution
+                    print("\n[Mixture Weight Distribution (Mean across batch)]")
+                    for k in range(pi_weights.shape[1]):
+                        avg_weight = pi_weights[:, k].mean().item()
+                        print(f"    Component {k+1}: {avg_weight:.2%}")
+                    print(f"=======================================================================\n", flush=True)
 
-        # --- PATH 3: Single Full-Covariance Gaussian (Non-Mixture) ---
-        if self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
-            mu, L = out["mu"], out["L"]
-            loss = self._mvn_nll_from_cholesky(mu, L, y)
-            
-            # Add sigma regularization for single Gaussian too
-            sigma_diag = torch.sqrt((L.float().square()).sum(dim=-1))
-            target_sigma = 1.0
-            reg_weight = 0.1  # Lighter for single Gaussian
-            
-            sigma_reg_loss = reg_weight * ((sigma_diag - target_sigma) ** 2).mean()
-            total_loss = loss + sigma_reg_loss
-            
-            if batch_idx == 0 and self.trainer.is_global_zero:
-                print(f"\n[Batch 0 Check - Epoch {self.current_epoch}]")
-                for i, name in enumerate(self.model_params):
-                    avg_sigma = sigma_diag[:, i].mean().item()
-                    print(f"  {name}: avg_sigma={avg_sigma:.3f}")
-            
+            else:
+                # --- STAGE 2: Train the full MDN with NLL and all penalties ---
+                # This is your complete, existing loss logic.
+                
+                # 5. Calculate loss based on the model's output structure.
+
+                # --- PATH 1 and 2: Mixture of Gaussians (MoG) with Full Covariance or Only Sigmas ---
+                if isinstance(out, dict) and ("pi_logits" in out or self.fixed_mixture_weights):
+                    
+                    if "L" in out:
+                        # Full covariance mixture
+                        loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
+                        # --- CRITICAL FIX: Regularize COMPONENT sigmas, not marginal ---
+                        L_all = out["L"]  # Shape: [B, K, d, d]
+                        K = L_all.shape[1]
+
+                        # Calculate sigma for each component: [B, K, d]
+                        sigma_components = torch.sqrt((L_all.float().square()).sum(dim=-1))
+
+                        # --- SECTION 1: GENTLE PULL TOWARDS A HEALTHY MEAN ---
+                        # Re-enable this with a small weight. It provides a constant, gentle pressure
+                        # to keep all sigmas in a reasonable range and prevents them from drifting too high.
+                        target_sigma = 0.1
+                        soft_reg_weight = 0.01  # A small value like 0.01 is a good start
+                        sigma_reg_loss = soft_reg_weight * ((sigma_components - target_sigma) ** 2).mean()
+
+                        # --- SECTION 2: STRONG, TARGETED ANTI-COLLAPSE PENALTY ---
+                        # This is your most important tool. We will set higher floors for the problem parameters.
+                        min_sigma_thresholds = torch.ones(len(self.model_params), device=self.device) * 0.005 # Base floor
+                        name2idx = {n: i for i, n in enumerate(self.model_params)}
+
+                        # UNCOMMENT AND SET SPECIFIC, HIGHER THRESHOLDS FOR PROBLEM PARAMETERS:
+                        if 'ro' in name2idx:
+                            min_sigma_thresholds[name2idx['ro']] = 0.01  # Force 'ro' to stay above 0.2
+                        if 'NCH3CN' in name2idx:
+                            min_sigma_thresholds[name2idx['NCH3CN']] = 0.01 # Force 'NCH3CN' to stay above 0.2
+                        if 'L' in name2idx:
+                            min_sigma_thresholds[name2idx['L']] = 0.01 # A slightly higher floor for 'L'
+
+                        # The penalty calculation itself is good. A weight of 30.0 is strong, which is what you need.
+                        min_sigma_thresholds = min_sigma_thresholds.view(1, 1, -1)
+                        violation = torch.clamp(min_sigma_thresholds - sigma_components, min=0.0)
+                        min_sigma_penalty = 20.0 * (violation ** 2).mean()
+
+                        # --- SECTION 3: (OPTIONAL) PENALTY FOR EXCESSIVE UNCERTAINTY ---
+                        # Keeping this is fine. It prevents the model from becoming too uncertain, but it's not
+                        # the solution to your current problem of *too little* uncertainty.
+                        max_sigma_threshold = 3.0
+                        violation_max = torch.clamp(sigma_components - max_sigma_threshold, min=0.0)
+                        max_sigma_penalty = 0.1 * (violation_max ** 2).mean()
+
+                        # --- FINAL LOSS CALCULATION ---
+                        total_loss = loss + sigma_reg_loss + min_sigma_penalty + max_sigma_penalty
+                        
+                        # --- START: ENTROPY PENALTY TO PREVENT MIXTURE COLLAPSE ---
+                        # Initialize as a zero tensor on the correct device to ensure it exists for logging
+                        mixture_penalty = torch.tensor(0.0, device=self.device)
+                        num_mixtures = out["pi_logits"].shape[1]
+                        if num_mixtures > 1 and not self.fixed_mixture_weights:
+                            # Get the softmax (probabilities) and log_softmax of the mixture logits
+                            pi_weights = torch.softmax(out["pi_logits"], dim=-1)  # Shape: [B, K]
+                            log_pi = F.log_softmax(out["pi_logits"], dim=-1)
+
+                            # Calculate the negative entropy. The optimizer will try to make this
+                            # value less negative (i.e., maximize entropy), encouraging balanced weights.
+                            negative_entropy = (pi_weights * log_pi).sum(dim=-1).mean()
+
+                            # Define the strength of the penalty. This is a new hyperparameter you can tune.
+                            # Start with a small value like 0.01.
+                            mixture_penalty_weight = 0.01
+
+                            # Calculate the final penalty term to be added to the loss
+                            mixture_penalty = mixture_penalty_weight * negative_entropy
+
+                            # Add the penalty to the total loss
+                            total_loss = total_loss + mixture_penalty
+                        # --- END: ENTROPY PENALTY ---
+                    
+                        
+                        # --- UPDATED DIAGNOSTIC LOGGING BLOCK ---
+                        # This block should replace your existing print statements for batch 0
+                        if batch_idx == 0 and self.trainer.is_global_zero:
+                            print(f"\n==================== [STAGE 2 - Epoch {self.current_epoch}] ====================")
+
+                            # 1. Print sigma statistics (as before)
+                            print("[Sigma Statistics (Component-wise)]")
+                            for i, name in enumerate(self.model_params):
+                                avg_sigma = sigma_components[:, :, i].mean().item()
+                                min_sigma = sigma_components[:, :, i].min().item()
+                                max_sigma = sigma_components[:, :, i].max().item()
+                                print(f"  {name}: avg={avg_sigma:.3f}, min={min_sigma:.3f}, max={max_sigma:.3f}")
+
+                            # 2. Print mixture weight distribution (crucial for diagnosing collapse)
+                            if num_mixtures > 1:
+                                pi = torch.softmax(out["pi_logits"], dim=-1)  # Re-calculate for clarity
+                                print("\n[Mixture Weight Distribution (Mean across batch)]")
+                                for k in range(pi.shape[1]):
+                                    avg_weight = pi[:, k].mean().item()
+                                    print(f"    Component {k+1}: {avg_weight:.2%}")
+                            
+                            # 3. Print a detailed breakdown of the loss components
+                            print("\n[Loss Breakdown]")
+                            print(f"    NLL Loss:                {loss.item():.4f}")
+                            print(f"    Sigma Reg Loss:          {sigma_reg_loss.item():.4f}") # Uncomment if you use it
+                            print(f"    Min Sigma Penalty:       {min_sigma_penalty.item():.4f}") # Uncomment if you use it
+                            print(f"    Max Sigma Penalty:       {max_sigma_penalty.item():.4f}") # Uncomment if you use it
+                            print(f"    Mixture Entropy Penalty:   {mixture_penalty.item():.4f}")
+                            print(f"    ---------------------------------")
+                            print(f"    Total Loss:              {total_loss.item():.4f}")
+                            print(f"=======================================================================\n", flush=True)
+                        
+                        # Log individual components for Stage 2
+                        self.log("train/nll", loss, on_step=False, on_epoch=True, sync_dist=True)
+                        self.log("train/sigma_reg", sigma_reg_loss, on_step=False, on_epoch=True, sync_dist=True)
+                        self.log("train/min_sigma_penalty", min_sigma_penalty, on_step=False, on_epoch=True, sync_dist=True)
+
+                    else: # "sigma" in out
+                        # Diagonal covariance mixture
+                        loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
+
+                        # Similar regularization for diagonal case
+                        sigma_all = out["sigma"]  # Shape: [B, K, d]
+                        target_sigma = 1.0
+                        reg_weight = 1.0
+                        
+                        # Per-parameter weighting
+                        param_weights = torch.ones(len(self.model_params), device=self.device)
+                        name2idx = {n: i for i, n in enumerate(self.model_params)}
+                        if 'D' in name2idx:
+                            param_weights[name2idx['D']] = 3.0
+                        if 'L' in name2idx:
+                            param_weights[name2idx['L']] = 2.0
+                        
+                        sigma_diff = (sigma_all - target_sigma) ** 2
+                        weighted_diff = sigma_diff * param_weights.view(1, 1, -1)
+                        sigma_reg_loss = reg_weight * weighted_diff.mean()
+                        
+                        # Minimum sigma constraint
+                        min_sigma_threshold = 0.01
+                        violation = torch.clamp(min_sigma_threshold - sigma_all, min=0.0)
+                        min_sigma_penalty = 10.0 * (violation ** 2).mean()
+                        
+                        total_loss = loss + sigma_reg_loss + min_sigma_penalty
+                        
+                        if batch_idx == 0 and self.trainer.is_global_zero:
+                            print(f"\n[Batch 0 Check - Epoch {self.current_epoch}]")
+                            for i, name in enumerate(self.model_params):
+                                avg_sigma = sigma_all[:, :, i].mean().item()
+                                min_sigma = sigma_all[:, :, i].min().item()
+                                max_sigma = sigma_all[:, :, i].max().item()
+                                print(f"  {name}: avg_sigma={avg_sigma:.3f}, min={min_sigma:.3f}, max={max_sigma:.3f}")
+
+                # --- PATH 3: Single Full-Covariance Gaussian (Non-Mixture) ---
+                elif self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
+                    mu, L = out["mu"], out["L"]
+                    loss = self._mvn_nll_from_cholesky(mu, L, y)
+                    
+                    # Add sigma regularization for single Gaussian too
+                    sigma_diag = torch.sqrt((L.float().square()).sum(dim=-1))
+                    target_sigma = 1.0
+                    reg_weight = 0.1  # Lighter for single Gaussian
+                    
+                    sigma_reg_loss = reg_weight * ((sigma_diag - target_sigma) ** 2).mean()
+                    total_loss = loss + sigma_reg_loss
+                    
+                    if batch_idx == 0 and self.trainer.is_global_zero:
+                        print(f"\n[Batch 0 Check - Epoch {self.current_epoch}]")
+                        for i, name in enumerate(self.model_params):
+                            avg_sigma = sigma_diag[:, i].mean().item()
+                            print(f"  {name}: avg_sigma={avg_sigma:.3f}")
+
+                # --- PATH 4: Legacy Diagonal MDN (kept for backward compatibility) ---
+                elif self.use_mdn:
+                    total_loss, per_param = self._compute_loss(out, y, return_per_param=True)
+                    
+                    # Log the per-parameter NLL for debugging
+                    for k, v in per_param.items():
+                        self.log(f"train/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
+
+                # --- PATH 5: Standard Regression (MSE) ---
+                else:
+                    total_loss = self.criterion(out, y)
+
+            # --- END: TWO-STAGE LOSS LOGIC ---
+
+            # Log the final total loss and return it
             self.log("train/loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/nll", loss, on_step=False, on_epoch=True, sync_dist=True)
-            self.log("train/sigma_reg", sigma_reg_loss, on_step=False, on_epoch=True, sync_dist=True)
             return total_loss
-
-        # --- PATH 4: Legacy Diagonal MDN (kept for backward compatibility) ---
-        if self.use_mdn:
-            loss, per_param = self._compute_loss(out, y, return_per_param=True)
-            
-            # Log the per-parameter NLL for debugging
-            for k, v in per_param.items():
-                self.log(f"train/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
-            
-            self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-            return loss
-
-        # --- PATH 5: Standard Regression (MSE) ---
-        loss = self.criterion(out, y)
-        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        return loss
 
 
     def on_validation_epoch_start(self):
@@ -556,10 +649,12 @@ class LitResNetMDN(LightningModule):
         x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
+
+        batch_size = x.size(0)
         
         # --- SNR Filtering with Integrated Noise Application ---
         min_snr = 10.0
-        max_retries = 10
+        max_retries = 20
         
         # Calculate signal for each sample (max intensity)
         signal = x.view(x.size(0), -1).max(dim=1)[0]  # [B]
@@ -570,19 +665,22 @@ class LitResNetMDN(LightningModule):
         gen.manual_seed(seed)
         
         # Initialize storage
-        valid_mask = torch.zeros(x.size(0), dtype=torch.bool, device=self.device)
-        x_augmented_list = []
-        snr_list = []
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        snr_values = torch.zeros(batch_size, device=self.device)
+        x_noisy = torch.zeros_like(x)
+        
+        #x_augmented_list = []
+        #snr_list = []
         rms_list = []
         
         # Process each sample individually with retry logic
-        for sample_idx in range(x.size(0)):
+        for sample_idx in range(batch_size):
             x_sample = x[sample_idx:sample_idx+1]  # Keep batch dim: [1, ...]
             
             for attempt in range(max_retries):
                 # Apply noise and GET the RMS used
                 if not self.apply_aug_train_only:
-                    x_noisy, rms = _apply_noise_and_mask_on_device(
+                    x_sample_noisy, rms = _apply_noise_and_mask_on_device(
                         x_sample.clone(),
                         gen=gen,
                         use_cauchy_gauss=self.aug_use_cauchy_gauss,
@@ -606,18 +704,22 @@ class LitResNetMDN(LightningModule):
                 # Check if SNR meets threshold
                 if snr >= min_snr:
                     valid_mask[sample_idx] = True
-                    x_augmented_list.append(x_noisy)
-                    snr_list.append(snr)
+                    #x_augmented_list.append(x_noisy)
+                    x_noisy[sample_idx] = x_sample_noisy[0]
+                    snr_values[sample_idx] = snr
+                    #snr_list.append(snr)
                     rms_list.append(rms_value)
                     break
             
             # If no valid noise found, sample is excluded
             if not valid_mask[sample_idx]:
                 # Use the last attempted values for logging
-                pass
+                x_noisy[sample_idx] = x_sample_noisy[0]
+                snr_values[sample_idx] = snr
+                #pass
         
         # Count exclusions
-        num_original = x.size(0)
+        num_original = batch_size
         num_valid = valid_mask.sum().item()
         num_excluded = num_original - num_valid
         
@@ -626,71 +728,94 @@ class LitResNetMDN(LightningModule):
         self._val_excluded_count += num_excluded
         
         # If no valid samples, return None
-        if num_valid == 0:
-            return None
+        #if num_valid == 0:
+        #    return None
         
         # Stack augmented samples
-        x = torch.cat(x_augmented_list, dim=0)
-        y = y[valid_mask]
-        snr_values = torch.tensor(snr_list, device=self.device)
+        # x = torch.cat(x_augmented_list, dim=0)
+        # y = y[valid_mask]
+        # snr_values = torch.tensor(snr_list, device=self.device)
         
-        # Sanity checks
-        self._sanity_checks(x, y, batch_idx)
+        # # Sanity checks
+        # self._sanity_checks(x, y, batch_idx)
 
-        # 2. Forward pass (rest is unchanged)
+        #Forward pass
         use_amp = x.is_cuda and "mixed" in str(getattr(self.trainer, "precision", ""))
         with torch.amp.autocast('cuda', enabled=use_amp):
-            out = self(x)
+            out = self(x_noisy)
         
-        # 3. Initialize output_dict and loss
-        output_dict = {"targets": y, "snr": snr_values}
+        # Initialize output_dict
+        output_dict = {"targets": y, "snr": snr_values, "valid_mask": valid_mask}
         loss = None
 
-        # 4-5. Calculate loss and populate output_dict
-        if isinstance(out, dict) and ("pi_logits" in out):
+        # Handle mixture model outputs
+        if isinstance(out, dict) and ("pi_logits" in out or self.fixed_mixture_weights):
+            
+            
             if "sigma" in out:
+                # Diagonal covariance mixture
                 loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
                 mu_mix, sig_mix = self._mixture_marginals_diag(out["pi_logits"], out["mu"], out["sigma"])
-                output_dict["sigma_all"] = out["sigma"]
-            else:
+                
+                # CRITICAL: Store ALL mixture data for corner plots
+                output_dict.update({
+                    "val_loss": loss.detach(),
+                    "preds": mu_mix,
+                    "sigmas": sig_mix,
+                    "snr": snr_values,
+                    "valid_mask": valid_mask,
+                    "mu_all": out["mu"],                 # [B, K, d]
+                    "sigma_all": out["sigma"],         # [B, K, d]
+                    "targets": y
+                })
+                
+            elif "L" in out:
+                # Full covariance mixture
                 loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
                 mu_mix, sig_mix = self._mixture_marginals_full(out["pi_logits"], out["mu"], out["L"])
-                output_dict["L_all"] = out["L"]
-
-            # DEBUG: Log marginal sigmas on first batch
-            if batch_idx == 0 and self.trainer.is_global_zero:
-                print(f"\n[VAL Batch 0 - Epoch {self.current_epoch}]")
-                print("Marginal sigmas (what gets cached):")
-                for i, name in enumerate(self.model_params):
-                    avg_sigma = sig_mix[:, i].mean().item()
-                    min_sigma = sig_mix[:, i].min().item()
-                    max_sigma = sig_mix[:, i].max().item()
-                    print(f"  {name}: avg={avg_sigma:.3f}, min={min_sigma:.6f}, max={max_sigma:.3f}")
-            
-
-            output_dict.update({
-                "preds": mu_mix, "sigmas": sig_mix, 
-                "pi_logits_all": out["pi_logits"], "mu_all": out["mu"]
-            })
+                
+                # CRITICAL: Store ALL mixture data for corner plots
+                output_dict.update({
+                    "val_loss": loss.detach(),
+                    "preds": mu_mix,
+                    "sigmas": sig_mix,
+                    "snr": snr_values,
+                    "valid_mask": valid_mask,
+                    "mu_all": out["mu"],                 # [B, K, d]
+                    "L_all": out["L"],                   # [B, K, d, d]
+                    "targets": y,
+                    "pi_logits_all": out["pi_logits"]  # [B, K]
+                })
 
         elif self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
+            # Single Gaussian full covariance
             mu, L = out["mu"], out["L"]
             loss = self._mvn_nll_from_cholesky(mu, L, y)
             sigma_diag = torch.sqrt((L.square()).sum(dim=-1))
-            output_dict.update({"preds": mu, "Ls": L, "sigmas": sigma_diag})
+            
+            output_dict.update({
+                "val_loss": loss.detach(),
+                "preds": mu,
+                "Ls": L,
+                "sigmas": sigma_diag,
+                "snr": snr_values,
+                "valid_mask": valid_mask,
+                "targets": y
+            })
+            
 
-        elif self.use_mdn:
-            mus, sigmas_raw = self._split_mdn_tuple(out, len(self.model_params))
-            sigmas = F.softplus(sigmas_raw) if not self.sigma_head_outputs_positive else sigmas_raw
-            sigmas = torch.clamp(sigmas, min=self.sigma_floor)
-            output_dict.update({"preds": mus, "sigmas": sigmas})
-            loss, per_param = self._compute_loss(out, y, return_per_param=True)
-            for k, v in per_param.items():
-                self.log(f"val/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
+        # elif self.use_mdn:
+        #     mus, sigmas_raw = self._split_mdn_tuple(out, len(self.model_params))
+        #     sigmas = F.softplus(sigmas_raw) if not self.sigma_head_outputs_positive else sigmas_raw
+        #     sigmas = torch.clamp(sigmas, min=self.sigma_floor)
+        #     output_dict.update({"preds": mus, "sigmas": sigmas})
+        #     loss, per_param = self._compute_loss(out, y, return_per_param=True)
+        #     for k, v in per_param.items():
+        #         self.log(f"val/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
 
-        else:  # Standard Regression
-            loss = self.criterion(out, y)
-            output_dict["preds"] = out
+        # else:  # Standard Regression
+        #     loss = self.criterion(out, y)
+        #     output_dict["preds"] = out
 
         if loss is None:
             print(f"WARNING: No loss calculated in validation_step for batch {batch_idx}")
@@ -706,37 +831,121 @@ class LitResNetMDN(LightningModule):
     def on_validation_epoch_end(self):
         """
         Aggregates validation results and logs SNR filtering statistics.
+        (Efficient and Corrected Refactor)
         """
         outputs = self.validation_step_outputs
-
-        # Log SNR filtering statistics
-        if hasattr(self, '_val_excluded_count'):
-            total_excluded = self._val_excluded_count
-            if self.trainer.is_global_zero:
-                print(f"\n[SNR Filtering] Excluded {total_excluded} samples due to SNR < 10")
-            self._val_excluded_count = 0  # Reset for next epoch
-
-        if self.trainer.global_rank != 0:
-            self._val_cache = {}
-            outputs.clear()
-            return
-
         if not outputs:
             self._val_cache = {}
-            outputs.clear()
-            return
+            return # No outputs to process
 
-        # Aggregate results
-        keys_to_aggregate = ["preds", "targets", "sigmas", "Ls", "pi_logits_all", 
-                            "mu_all", "L_all", "sigma_all", "snr"]  # Added "snr"
-        
-        final_cache = {}
+        # --- Step 1: Aggregate tensors ON DEVICE for each rank ---
+        aggregated_on_device = {}
+        keys_to_aggregate = ["preds", "targets", "sigmas", "Ls", "pi_logits_all",
+                            "mu_all", "L_all", "sigma_all", "snr", "valid_mask", "val_loss"]
+
         for key in keys_to_aggregate:
-            tensor_list = [batch_output[key] for batch_output in outputs if key in batch_output]
+            tensor_list = [batch_output[key] for batch_output in outputs
+                        if key in batch_output and batch_output[key] is not None]
+            
             if tensor_list:
-                final_cache[key] = torch.cat([t.detach().cpu() for t in tensor_list], dim=0)
+                # --- START: THE FIX ---
+                # Check if the tensors are scalars (like the loss value)
+                if tensor_list[0].ndim == 0:
+                    # For scalars, STACK them to create a new dimension (a 1D tensor of losses)
+                    aggregated_on_device[key] = torch.stack([t.detach() for t in tensor_list])
+                else:
+                    # For all other multi-dimensional tensors, CONCATENATE along the batch dimension
+                    aggregated_on_device[key] = torch.cat([t.detach() for t in tensor_list], dim=0)
+                # --- END: THE FIX ---
 
-        self._val_cache = final_cache
+        # --- Step 2: Gather aggregated tensors from all ranks (no changes here) ---
+        if self.trainer.world_size > 1:
+            gathered_tensors = self.all_gather(aggregated_on_device)
+        else:
+            gathered_tensors = aggregated_on_device
+
+        # --- Step 3: Final processing on Rank 0 (no changes here) ---
+        if self.trainer.is_global_zero:
+            final_cache = {}
+            for key, tensors in gathered_tensors.items():
+                if self.trainer.world_size > 1:
+                    # This reshape now correctly handles the stacked losses as well as the concatenated tensors
+                    final_cache[key] = tensors.reshape(-1, *tensors.shape[2:]).cpu()
+                else:
+                    final_cache[key] = tensors.cpu()
+
+            # --- The rest of your logic remains the same ---
+            # Log statistics BEFORE filtering
+            total_samples = len(final_cache.get("targets", []))
+            if "valid_mask" in final_cache:
+                valid_samples = final_cache["valid_mask"].sum().item()
+                invalid_samples = total_samples - valid_samples
+                
+                print(f"\n[Validation Summary]")
+                print(f"  Total samples processed: {total_samples}")
+                print(f"  Valid samples (SNR >= minimum): {valid_samples}")
+                print(f"  Invalid samples (SNR < minimum): {invalid_samples}")
+            
+            # Apply SNR filtering for the final cache
+            if "valid_mask" in final_cache and final_cache["valid_mask"].sum() > 0:
+                valid_mask = final_cache["valid_mask"].bool()
+                
+                filtered_cache = {}
+                keys_to_filter = ["preds", "targets", "sigmas", "snr", "pi_logits_all", 
+                                "mu_all", "L_all", "sigma_all", "Ls"]
+                
+                for key in keys_to_filter:
+                    if key in final_cache and final_cache[key] is not None:
+                        filtered_cache[key] = final_cache[key][valid_mask]
+                
+                self._val_cache = filtered_cache
+                print(f"  Samples in cache (after SNR filter): {len(self._val_cache['targets'])}")
+
+            else:
+                self._val_cache = final_cache
+                print(f"  No SNR filtering applied or no valid samples")
+
+                        # --- START: MEAN RELATIVE ERROR CALCULATION ---
+            # This block calculates (pred - true) / true in physical units.
+            print("\n[Mean Relative Error (post-SNR filter)]")
+            
+            # Ensure the cache has the necessary data before proceeding
+            if "preds" in self._val_cache and "targets" in self._val_cache:
+                dataset_ref = self.trainer.datamodule.dataset_ref
+                
+                # Step 1: Inverse transform predictions and targets to their original physical scale
+                preds_orig = dataset_ref.inverse_transform_labels(self._val_cache['preds'])
+                targets_orig = dataset_ref.inverse_transform_labels(self._val_cache['targets'])
+                
+                # Step 2: Loop through each parameter and calculate the metric
+                for i, name in enumerate(self.model_params):
+                    pred_param = preds_orig[:, i]
+                    target_param = targets_orig[:, i]
+                    
+                    # Create a mask to avoid division by zero
+                    mask = torch.abs(target_param) > 1e-9
+                    
+                    if mask.sum() > 0:
+                        # Calculate relative error only on non-zero true values
+                        relative_error = (pred_param[mask] - target_param[mask]) / target_param[mask]
+                        mean_relative_error = relative_error.mean().item()
+                        # Print as a percentage for readability
+                        print(f"  {name+':':<10} {mean_relative_error * 100: >7.2f}%")
+                    else:
+                        print(f"  {name+':':<10} N/A (all true values are zero)")
+            else:
+                print("  Could not calculate: 'preds' or 'targets' not found in cache.")
+            # --- END: MEAN RELATIVE ERROR CALCULATION ---
+            
+            # Compute and log average loss from the gathered and finalized loss tensor
+            avg_loss = final_cache["val_loss"].mean()
+            self.log("val/loss", avg_loss, prog_bar=True, on_epoch=True, sync_dist=False)
+            
+            if hasattr(self, '_val_excluded_count'):
+                print(f"  Samples excluded during retry attempts: {self._val_excluded_count}")
+                self._val_excluded_count = 0
+
+        # Finally, clear the step outputs on all ranks
         self.validation_step_outputs.clear()
         
     # ------------------------- Helper Methods -------------------------
@@ -966,7 +1175,7 @@ class LitResNetMDN(LightningModule):
         # The NLL is the negative of the mean total log probability.
         return -total_log_prob.mean()
 
-    def _mog_nll_full(self, pi_logits: torch.Tensor, mu: torch.Tensor, L: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def _mog_nll_full_old(self, pi_logits: torch.Tensor, mu: torch.Tensor, L: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
         Calculates the NLL for a Mixture of Gaussians with full covariance (using Cholesky factor L).
 
@@ -1001,6 +1210,55 @@ class LitResNetMDN(LightningModule):
         # Use logsumexp for the final stable calculation.
         total_log_prob = (log_pi + log_prob).logsumexp(dim=-1)
         return -total_log_prob.mean().to(mu.dtype)
+    
+    def _mog_nll_full(self, pi_logits: torch.Tensor, mu: torch.Tensor, L: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the NLL for a Mixture of Gaussians with full covariance (using Cholesky factor L).
+
+        Args:
+            pi_logits (torch.Tensor): Logits for mixture weights, shape [B, K].
+            mu (torch.Tensor): Means of the K components, shape [B, K, d].
+            L (torch.Tensor): Cholesky factors of the K components, shape [B, K, d, d].
+            y (torch.Tensor): Target vector, shape [B, d].
+
+        Returns:
+            torch.Tensor: The mean NLL loss over the batch.
+        """
+        B, K, d = mu.shape
+        log_pi = F.log_softmax(pi_logits, dim=-1)   # Shape: [B, K]
+
+        # Calculate log probability within a float32 context for stability.
+        with torch.amp.autocast('cuda', enabled=False):
+            # Convert to float32 for numerical stability
+            L_f32 = L.float()
+            mu_f32 = mu.float()
+            y_f32 = y.float()
+            
+            # Compute Mahalanobis distance: (y - μ)ᵀ Σ⁻¹ (y - μ)
+            # Since Σ = L @ Lᵀ, we have Σ⁻¹ = (Lᵀ)⁻¹ @ L⁻¹
+            # So (y - μ)ᵀ Σ⁻¹ (y - μ) = ||L⁻¹(y - μ)||²
+            y_mu = (y_f32.unsqueeze(1) - mu_f32).unsqueeze(-1)  # Shape: [B, K, d, 1]
+            z = torch.linalg.solve_triangular(L_f32, y_mu, upper=False)  # Shape: [B, K, d, 1]
+            maha = z.square().sum(dim=(-2, -1))  # Shape: [B, K]
+            
+            # Compute log determinant: log|Σ| = log|L @ Lᵀ| = 2 * log|L| = 2 * sum(log(diag(L)))
+            diag = torch.diagonal(L_f32, dim1=-2, dim2=-1)  # Shape: [B, K, d]
+            
+            # Add small epsilon to prevent log(0), though CovarianceHead should prevent this
+            logdet = 2.0 * torch.log(diag.clamp(min=1e-6)).sum(-1)  # Shape: [B, K]
+            
+            # Constant term
+            const = d * math.log(2.0 * math.pi)
+            
+            # Log probability for each component: log p(y | component k)
+            log_prob = -0.5 * (maha + logdet + const)  # Shape: [B, K]
+
+        # Mixture log probability: log p(y) = log(sum_k π_k * p(y | k))
+        # Computed stably as: logsumexp(log(π_k) + log(p(y | k)))
+        total_log_prob = (log_pi + log_prob).logsumexp(dim=-1)  # Shape: [B]
+        
+        # Return mean negative log likelihood
+        return -total_log_prob.mean()
 
     @staticmethod
     def _mixture_marginals_diag(pi_logits, mu, sigma):
@@ -1009,7 +1267,7 @@ class LitResNetMDN(LightningModule):
         
         FIXED: Proper floor on sigma, not variance.
         """
-        pi = F.softmax(pi_logits, dim=-1)  # [B, K]
+        pi = F.softmax(pi_logits, dim=-1) # [B, K]
         
         # E[x] = sum_k( pi_k * mu_k )
         mu_mix = (pi.unsqueeze(-1) * mu).sum(dim=1)  # [B, d]
@@ -1035,13 +1293,14 @@ class LitResNetMDN(LightningModule):
         
         FIXED: Proper floor on sigma, not variance.
         """
-        pi = F.softmax(pi_logits, dim=-1)  # [B, K]
         
+        pi = F.softmax(pi_logits, dim=-1)
         # Mean: E[X] = sum_k pi_k * mu_k
         mu_mix = (pi.unsqueeze(-1) * mu).sum(dim=1)  # [B, d]
         
         # Diagonal of covariance matrix for each component
-        diag_Sigma_k = (L * L).sum(dim=-1)  # [B, K, d]
+        #diag_Sigma_k = (L * L).sum(dim=-1)  # [B, K, d]
+        diag_Sigma_k = torch.einsum('...ij,...ij->...i', L, L) 
         
         # Variance: Var[X] = E[Var[X|k]] + Var[E[X|k]]
         #                  = sum_k pi_k * (Sigma_k + mu_k^2) - mu_mix^2
@@ -1096,59 +1355,137 @@ class LitResNetMDN(LightningModule):
     def on_test_start(self):
         """Called at the beginning of testing."""
         self.test_step_outputs = []
+        # --- Add counter for excluded samples ---
+        self._test_excluded_count = 0
 
     def test_step(self, batch, batch_idx):
-        # This method should be refactored to look almost identical to the new validation_step
-        # It should return a dictionary of outputs.
+        """
+        Test step with SNR-based filtering, consistent with validation.
+        """
+        # --- START: Copied and adapted logic from validation_step ---
+        # 1. Boilerplate setup
         x, y, _ = self._split_batch(batch)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
-        self._sanity_checks(x, y, batch_idx)
 
-        use_amp = x.is_cuda and isinstance(getattr(self.trainer, "precision", ""), str)
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            out = self(x)
+        batch_size = x.size(0)
         
-        output_dict = {"targets": y}
+        # SNR Filtering with Integrated Noise Application
+        min_snr = 10.0
+        max_retries = 20
+        
+        signal = x.view(x.size(0), -1).max(dim=1)[0]
+        
+        # Use a fixed seed for the entire test set for perfect reproducibility
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(42) # A fixed seed
+        
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        snr_values = torch.zeros(batch_size, device=self.device)
+        x_noisy = torch.zeros_like(x)
+        
+        for sample_idx in range(batch_size):
+            x_sample = x[sample_idx:sample_idx+1]
+            
+            for attempt in range(max_retries):
+                x_sample_noisy, rms = _apply_noise_and_mask_on_device(
+                    x_sample.clone(), gen=gen,
+                    use_cauchy_gauss=self.aug_use_cauchy_gauss,
+                    cauchy_mu=self.aug_cauchy_mu, cauchy_sigma=self.aug_cauchy_sigma,
+                    cauchy_threshold=self.aug_cauchy_threshold,
+                    add_gauss_sigma=self.aug_add_gauss_sigma,
+                    mask_frac=0.0, # Typically no masking/dropout in testing
+                    return_rms=True
+                )
+                rms_value = rms[0].item()
+                
+                snr = signal[sample_idx].item() / rms_value if rms_value > 0 else float('inf')
+                
+                if snr >= min_snr:
+                    valid_mask[sample_idx] = True
+                    x_noisy[sample_idx] = x_sample_noisy[0]
+                    snr_values[sample_idx] = snr
+                    break
+            
+            if not valid_mask[sample_idx]:
+                x_noisy[sample_idx] = x_sample_noisy[0]
+                snr_values[sample_idx] = snr
+        
+        self._test_excluded_count += (batch_size - valid_mask.sum().item())
+        
+        # 2. Forward pass
+        use_amp = x.is_cuda and "mixed" in str(getattr(self.trainer, "precision", ""))
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            out = self(x_noisy)
+        # --- END: Copied and adapted logic ---
+        
+        output_dict = {
+            "targets": y, 
+            "snr": snr_values, 
+            "valid_mask": valid_mask
+        }
         loss = None
         
         stage = "test"
-        # --- PATH 1: Mixture of Gaussians (MoG) ---
-        
-        if isinstance(out, dict) and ("pi_logits" in out):
-            # ... (MoG logic as before) ...
-            # Creates mu_mix, sig_mix, and populates output_dict
-            if "sigma" in out:
-                loss = self._mog_nll_diag(out["pi_logits"], out["mu"], out["sigma"], y)
-                mu_mix, sig_mix = self._mixture_marginals_diag(out["pi_logits"], out["mu"], out["sigma"])
-                output_dict["sigma_all"] = out["sigma"]
+        # Handle mixture model outputs
+        if isinstance(out, dict) and ("pi_logits" in out or self.fixed_mixture_weights):
+            # --- Determine mixture weights pi ---
+            if "pi_logits" in out:
+                pi = F.softmax(out["pi_logits"], dim=-1)
+                output_dict["pi_logits_all"] = out["pi_logits"] # Still save original logits
             else:
-                loss = self._mog_nll_full(out["pi_logits"], out["mu"], out["L"], y)
-                mu_mix, sig_mix = self._mixture_marginals_full(out["pi_logits"], out["mu"], out["L"])
-                output_dict["L_all"] = out["L"]
+                pi = self.fixed_pi.unsqueeze(0).expand(out["mu"].shape[0], -1)
 
-            output_dict.update({
-                "preds": mu_mix, "sigmas": sig_mix, "pi_logits_all": out["pi_logits"], "mu_all": out["mu"]
-            })
+            
+            if "sigma" in out:
+                # Diagonal covariance mixture
+                loss = self._mog_nll_diag(pi, out["mu"], out["sigma"], y)
+                mu_mix, sig_mix = self._mixture_marginals_diag(pi, out["mu"], out["sigma"])
+                
+                # CRITICAL: Store ALL mixture data for corner plots
+                output_dict.update({
+                    "val_loss": loss.detach(),
+                    "preds": mu_mix,
+                    "sigmas": sig_mix,
+                    "snr": snr_values,
+                    "valid_mask": valid_mask,
+                    "mu_all": out["mu"],                 # [B, K, d]
+                    "sigma_all": out["sigma"],           # [B, K, d]
+                    "targets": y
+                })
+                
+            elif "L" in out:
+                # Full covariance mixture
+                loss = self._mog_nll_full(pi, out["mu"], out["L"], y)
+                mu_mix, sig_mix = self._mixture_marginals_full(pi, out["mu"], out["L"])
+                
+                # CRITICAL: Store ALL mixture data for corner plots
+                output_dict.update({
+                    "val_loss": loss.detach(),
+                    "preds": mu_mix,
+                    "sigmas": sig_mix,
+                    "snr": snr_values,
+                    "valid_mask": valid_mask,
+                    "mu_all": out["mu"],                 # [B, K, d]
+                    "L_all": out["L"],                   # [B, K, d, d]
+                    "targets": y
+                })
 
         elif self.use_mdn and self.covariance_type == "full" and self._is_fullcov_out(out):
+            # Single Gaussian full covariance
             mu, L = out["mu"], out["L"]
             loss = self._mvn_nll_from_cholesky(mu, L, y)
             sigma_diag = torch.sqrt((L.square()).sum(dim=-1))
-            output_dict.update({"preds": mu, "Ls": L, "sigmas": sigma_diag})
-
-        elif self.use_mdn:
-            mus, sigmas_raw = self._split_mdn_tuple(out, len(self.model_params))
-            sigmas = F.softplus(sigmas_raw) if not self.sigma_head_outputs_positive else sigmas_raw
-            sigmas = torch.clamp(sigmas, min=self.sigma_floor)
-            output_dict.update({"preds": mus, "sigmas": sigmas})
-            loss, per_param = self._compute_loss(out, y, return_per_param=True)
-            for k, v in per_param.items():
-                self.log(f"val/{k}_nll", v, on_step=False, on_epoch=True, sync_dist=True)
-
-        else: # Standard Regression
-            loss = self.criterion(out, y)
-            output_dict["preds"] = out
+            
+            output_dict.update({
+                "val_loss": loss.detach(),
+                "preds": mu,
+                "Ls": L,
+                "sigmas": sigma_diag,
+                "snr": snr_values,
+                "valid_mask": valid_mask,
+                "targets": y
+            })
 
         self.test_step_outputs.append(output_dict)
 
@@ -1156,35 +1493,63 @@ class LitResNetMDN(LightningModule):
             self.log("test/loss", loss, on_step=False, on_epoch=True, sync_dist=True)
             
         return output_dict
-
+    
     def on_test_epoch_end(self):
-        # This logic is very similar to on_validation_epoch_end
-        # It's where you would create a final cache for test-time callbacks if you had any.
-
-        # The 'outputs' list is now the instance attribute we created.
+        """
+        Aggregates test results, handling DDP and SNR filtering.
+        """
         outputs = self.test_step_outputs
-
-        # On non-main processes, we only need to clear the list and exit.
-        if self.trainer.global_rank != 0:
-            outputs.clear() # Free memory on non-primary ranks
-            return
-
-        # --- Aggregation Logic (runs only on Rank 0) ---
-        if not outputs: # Check if the outputs list is empty
-            self._val_cache = {} # Ensure cache is empty for callbacks
-            outputs.clear() # Clear the list for the next epoch
-            return
-
-
-        keys_to_aggregate = ["preds", "targets", "sigmas", "Ls", "pi_logits_all", "mu_all", "L_all", "sigma_all"]
-        final_cache = {}
-        for key in keys_to_aggregate:
-            tensor_list = [batch_output[key] for batch_output in outputs if key in batch_output]
-            if tensor_list:
-                final_cache[key] = torch.cat([t.detach().cpu() for t in tensor_list], dim=0)
         
-        # You would typically save this cache or use it for final report generation.
-        self._test_cache = final_cache
+        # --- START: Copied and adapted logic from on_validation_epoch_end ---
+        if not outputs:
+            self._test_cache = {}
+            outputs.clear()
+            return
+
+        # Aggregate ALL samples
+        keys_to_aggregate = ["preds", "targets", "sigmas", "snr", "valid_mask"] # Add other keys if needed
+        local_aggregated = {}
+        for key in keys_to_aggregate:
+            tensor_list = [o[key] for o in outputs if key in o and o[key] is not None]
+            if tensor_list:
+                local_aggregated[key] = torch.cat([t.detach().cpu() for t in tensor_list], dim=0)
+
+        # Gather across GPUs
+        final_cache = {}
+        if self.trainer.world_size > 1:
+            gathered = self.all_gather(local_aggregated)
+            if self.trainer.is_global_zero:
+                # Concatenate results from all GPUs
+                for key, tensor_list in gathered.items():
+                    final_cache[key] = torch.cat(list(tensor_list), dim=0)
+            else:
+                outputs.clear()
+                return
+        else:
+            final_cache = local_aggregated
+        
+        # On rank 0, perform filtering and logging
+        if self.trainer.is_global_zero:
+            total_samples = len(final_cache.get("targets", []))
+            valid_samples = final_cache["valid_mask"].sum().item()
+            
+            print("\n[Test Summary]")
+            print(f"  Total samples processed: {total_samples}")
+            print(f"  Valid samples (SNR >= minimum): {valid_samples}")
+            print(f"  Excluded samples: {total_samples - valid_samples}")
+
+            # Filter results for final cache
+            valid_mask = final_cache["valid_mask"].bool()
+            self._test_cache = {}
+            for key in ["preds", "targets", "sigmas", "snr"]:
+                if key in final_cache and final_cache[key] is not None:
+                    self._test_cache[key] = final_cache[key][valid_mask]
+            print(f"  Samples in final test cache: {len(self._test_cache.get('targets', []))}")
+        
+        outputs.clear()
+        # --- END: Copied and adapted logic ---
+
+    
 
     # ------------------- Optimizer and Scheduler Configuration -------------------
 
@@ -1218,3 +1583,118 @@ class LitResNetMDN(LightningModule):
                 "frequency": 1         # Check the metric every validation epoch
             }
         }
+    
+    # Gradient debugging hook for DDP training
+
+    def on_before_optimizer_step(self, optimizer):
+        # --- DDP GRADIENT DEBUGGER ---
+        # This hook is guaranteed to run after .backward() and before .step().
+        # We check on batch_idx 0 of every epoch.
+        plot_gradient_debug_print = True  # Set to True to enable gradient debugging prints
+        if self.trainer.global_step % self.trainer.num_training_batches == 0 and self.trainer.is_global_zero and plot_gradient_debug_print:
+            print(f"\n--- [GRADIENT DEBUGGER - Epoch {self.trainer.current_epoch}, Stage {'1' if self.is_stage_1 else '2'}] ---")
+            found_culprit = False
+            # Use a color library if available for readability, otherwise use plain text
+            try:
+                from colorama import Fore, Style
+                RED = Fore.RED
+                GREEN = Fore.GREEN
+                YELLOW = Fore.YELLOW
+                RESET = Style.RESET_ALL
+            except ImportError:
+                RED = GREEN = YELLOW = RESET = ""
+
+            for name, param in self.named_parameters():
+                # Check for the culprit: a parameter that REQUIRES a gradient but did NOT receive one.
+                if param.requires_grad and param.grad is None:
+                    print(f"{RED}[CULPRIT] Param '{name}' requires a gradient but did not receive one.{RESET}")
+                    found_culprit = True
+            
+            if not found_culprit:
+                print(f"{GREEN}All parameters that require gradients received them. No culprits found.{RESET}")
+            print(f"--- [END DEBUGGER] ---\n", flush=True)
+
+    # In lightning_resnet.py, inside the LitResNetMDN class
+
+    # --- 1. Add this new setup method ---
+    def setup(self, stage: str):
+        """
+        Called at the beginning of fit, validate, or test. This is the ideal
+        place to perform model modifications before DDP wrapping.
+        """
+        if stage == 'fit':
+            # Check if two-stage training is enabled in the config
+            is_two_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
+            
+            if is_two_stage:
+                self.print(f"\n{'='*80}")
+                self.print(f"SETUP hook: Two-stage training is enabled. Freezing cov_head by default for Stage 1.")
+                self.print(f"{'='*80}\n", flush=True)
+                
+                # Freeze the covariance head here. This happens on every process
+                # BEFORE DDP is configured, so it won't see these params as trainable.
+                for param in self.model.cov_head.parameters():
+                    param.requires_grad = False
+                
+                self.is_stage_1 = True
+            else:
+                self.is_stage_1 = False
+
+    # --- 2. Add this new on_train_start hook for handling resumes ---
+    def on_train_start(self):
+        """
+        Called after the checkpoint is loaded. Use this to handle resuming in Stage 2.
+        """
+        # Read from the new hparams location
+        is_two_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
+        if not is_two_stage:
+            return
+
+        switch_epoch = self.hparams.training_cfg.get("two_stage_training", {}).get("switch_epoch", 9999)
+
+        # If we are resuming from a checkpoint that is already in Stage 2...
+        if self.current_epoch >= switch_epoch:
+            self.print(f"\n{'='*80}")
+            self.print(f"ON_TRAIN_START: Resuming in STAGE 2 (epoch {self.current_epoch}). Unfreezing cov_head.")
+            self.print(f"{'='*80}\n", flush=True)
+            
+            # Unfreeze the head and update the state
+            for param in self.model.cov_head.parameters():
+                param.requires_grad = True
+            self.is_stage_1 = False
+
+    # --- 3. Add this new on_train_epoch_start hook for the live transition ---
+    def on_train_epoch_start(self):
+        """
+        Called at the start of each epoch. Use this to transition from Stage 1 to 2.
+        """
+        # Read from the new hparams location
+        is_two_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
+        if not is_two_stage or not self.is_stage_1: # Only run if enabled and still in Stage 1
+            return
+
+        switch_epoch = self.hparams.training_cfg.get("two_stage_training", {}).get("switch_epoch", 9999)
+
+        # If this is the epoch to make the switch...
+        if self.current_epoch == switch_epoch:
+            self.print(f"\n{'='*80}")
+            self.print(f"ON_TRAIN_EPOCH_START: Transitioning to STAGE 2 at epoch {self.current_epoch}.")
+            self.print("Unfreezing covariance head and reconfiguring optimizer.")
+            self.print(f"{'='*80}\n", flush=True)
+
+            # 1. Unfreeze
+            for param in self.model.cov_head.parameters():
+                param.requires_grad = True
+            
+            # 2. Update state
+            self.is_stage_1 = False
+
+            # 3. Reconfigure optimizer(s) to include the new parameters
+            # Lightning is smart enough to handle this automatically when you re-assign them.
+            new_lr = self.hparams.optim_cfg.lr / 5.0
+            optimizer = torch.optim.AdamW(
+                self.parameters(), # self.parameters() now correctly includes the un-frozen head
+                lr=new_lr,
+                weight_decay=self.hparams.optim_cfg.weight_decay,
+            )
+            self.trainer.optimizers = [optimizer]

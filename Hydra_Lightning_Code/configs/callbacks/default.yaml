@@ -3,12 +3,17 @@
 early_stopping:
   _target_: lightning.pytorch.callbacks.EarlyStopping
   monitor: val/loss
-  patience: 50
+  patience: 100
   mode: min
 
 prediction_scatter:
   _target_: src.callbacks.prediction_plot_callback.PredictionPlotCallback
   output_dir: ${outputs_dir}
+  enable_parameter_space_diagnostics: true      # Enable diagnostics
+  diagnostic_target_params: ['p', 'Tlow']       # Only these params
+  diagnostic_plot_every_n_epochs: 10             # Every 10 epochs
+
+
 
 loss_curves:
   _target_: src.callbacks.loss_curves.LossCurvesCallback
@@ -58,6 +63,12 @@ model_checkpoint:
   every_n_epochs: 1  # Save every epoch (or increase to save less often)
   verbose: true
   auto_insert_metric_name: false
+
+
+# two_stage_manager: 
+#     _target_: src.callbacks.two_stage_callback.TwoStageMDNTraining
+#     switch_epoch: 80 # The epoch at which Stage 2 begins
+#     use_two_stage: true
 
 
 

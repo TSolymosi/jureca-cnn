@@ -18,6 +18,13 @@ logger:
   name: ${folder_name}
   version: ${job_id}   # prevents "version_#"
 
+# --- top-level-block to control two-stage training strategy ---
+# We will pass this entire block to our LightningModule.
+training_strategy:
+  two_stage_training:
+    enabled: True
+    switch_epoch: 80
+
 hydra:
   run:
     dir: ${outputs_dir}

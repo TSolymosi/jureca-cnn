@@ -84,7 +84,13 @@ class LossCurvesCallback(Callback):
     def on_fit_end(self, trainer, pl_module):
         # resolve output directory
         os.makedirs(self.output_dir, exist_ok=True)
-
+        # Skip first epoch as training and vaildation losses are often very high there
+        self.history["epoch"] = self.history["epoch"][1:]
+        self.history["train/loss"] = self.history["train/loss"][1:]
+        self.history["val/loss"] = self.history["val/loss"][1:]
+        for pname in self.per_param:
+            self.per_param[pname] = self.per_param[pname][1:]
+        
         # overall train vs val
         print(self.history)
         if len(self.history["epoch"]) > 0:

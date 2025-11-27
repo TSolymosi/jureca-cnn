@@ -101,9 +101,11 @@ class HybridCornerPlotCallback(Callback):
         cache = getattr(pl_module, "_val_cache", None)
         if not isinstance(cache, dict):
             return None
+        print("[HybridCornerPlot] Validation cache found, searching for data...")
         targets = cache.get("targets", None)
         if targets is None:
             return None
+        
         
         # Check for mixture model outputs
         pi_logits = cache.get("pi_logits_all", None)
@@ -133,6 +135,17 @@ class HybridCornerPlotCallback(Callback):
     @rank_zero_only
     def on_validation_epoch_end(self, trainer, pl_module):
         """Main callback function - called after each validation epoch."""
+
+        if trainer.is_global_zero and hasattr(self, '_val_cache'):
+            print("\n[DEBUG] Cache contents for corner plot callback:")
+            for key, val in self._val_cache.items():
+                if val is not None:
+                    if hasattr(val, 'shape'):
+                        print(f"  {key}: shape={val.shape}, dtype={val.dtype}")
+                    else:
+                        print(f"  {key}: {type(val)}")
+
+                        
         epoch = trainer.current_epoch
         if (epoch + 1) % self.plot_every_n_epochs != 0:
             return
@@ -250,7 +263,15 @@ class HybridCornerPlotCallback(Callback):
                 up_str = _smart_format(upper, self.param_names[j], self.log_scale_params)
                 low_str = _smart_format(lower, self.param_names[j], self.log_scale_params)
                 
-                title = f"${med_str}^{{+{up_str}}}_{{-{low_str}}}$"
+                # Make sure to mention the parameter name in title, for log_scale_params show log(10) param
+                if self.param_names[j] in self.log_scale_params:
+                    # title = f"log$_{{10}}$({self.param_names[j]}): ${med_str}^{{+{up_str}}}_{{-{low_str}}}$"
+                    title = f"log$_{{10}}$({self.param_names[j]})"
+                else:
+                    #title = f"{self.param_names[j]}: ${med_str}^{{+{up_str}}}_{{-{low_str}}}$"
+                    title = f"{self.param_names[j]}"
+                    
+                
                 titles.append(title)
             
             # Generate corner plot

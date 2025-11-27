@@ -111,11 +111,11 @@ class CalibrationCheckCallback(Callback):
             sigma_max = sigmas_scaled[:, i].max().item()
             
             # Count collapsed samples
-            n_collapsed = (sigmas_scaled[:, i] < 0.001).sum().item()
+            n_collapsed = (sigmas_scaled[:, i] < 0.00011).sum().item()
             
             print(f"{param}:")
             print(f"  σ_scaled: mean={sigma_mean:.6f}, min={sigma_min:.6f}, max={sigma_max:.6f}")
-            print(f"  Collapsed samples (σ<0.001): {n_collapsed}/{len(sigmas_scaled)}")
+            print(f"  Collapsed samples (σ<0.00011): {n_collapsed}/{len(sigmas_scaled)}")
         
         # CRITICAL: Floor the sigmas to prevent division by near-zero
         sigmas_scaled_safe = torch.clamp(sigmas_scaled, min=1e-3)  # Floor at 0.001
@@ -189,6 +189,22 @@ class CalibrationCheckCallback(Callback):
             snr_binned_metrics = self._calculate_snr_binned_metrics(
                 z_scores_scaled[:, i], snr, sigma_levels
             ) if snr is not None else None
+
+            # --- START: MODIFIED RESIDUAL CALCULATION ---
+            # Calculate the correct type of residual based on parameter scaling
+            y_i_orig = y_orig[:, i]
+            mu_i_orig = mu_orig[:, i]
+            
+            if param_name in self.log_scale_params:
+                # For log-params, use RELATIVE residual to be scale-invariant
+                mask = torch.abs(y_i_orig) > 1e-9
+                residuals_for_plotting = torch.full_like(y_i_orig, float('nan'))
+                residuals_for_plotting[mask] = (mu_i_orig[mask] - y_i_orig[mask]) / y_i_orig[mask]
+            else:
+                # For linear-params, ABSOLUTE residual is fine
+                residuals_for_plotting = mu_i_orig - y_i_orig
+            # --- END: MODIFIED RESIDUAL CALCULATION ---
+
             
             results[param_name] = {
                 'actual': actual_coverage,
@@ -197,7 +213,7 @@ class CalibrationCheckCallback(Callback):
                 # Store both scaled and original for different visualizations
                 'sigma_scaled': sigma_scaled[:, i].cpu().numpy(),
                 'sigma_orig': sigma_orig[:, i].cpu().numpy(),
-                'residuals_orig': (mu_orig[:, i] - y_orig[:, i]).cpu().numpy(),
+                'residuals_orig': residuals_for_plotting.cpu().numpy(), # Use the corrected residual
                 'residuals_scaled': (mu_scaled[:, i] - y_scaled[:, i]).cpu().numpy(),
                 'true_values_orig': y_orig[:, i].cpu().numpy(),
                 'pred_values_orig': mu_orig[:, i].cpu().numpy(),
@@ -210,6 +226,7 @@ class CalibrationCheckCallback(Callback):
         self._plot_calibration_curves(results, epoch)
         self._plot_z_score_histograms(results, epoch)
         self._plot_per_parameter_summary(results, epoch)
+        self._plot_residuals_vs_true_symlog(results, epoch) 
         
         # SNR-aware plots
         if snr is not None:
@@ -536,8 +553,17 @@ class CalibrationCheckCallback(Callback):
         plt.savefig(os.path.join(self.output_dir, f'E{epoch+1}_sigma_vs_value_snr.png'), dpi=150, bbox_inches='tight')
         plt.close()
     
-    def _plot_residuals_vs_sigma_by_snr(self, results, epoch, snr):
-        """Plot residuals vs predicted sigma, colored by SNR (in original space for interpretability)."""
+    
+    
+    
+
+    def _plot_residuals_vs_sigma_by_snr_old(self, results, epoch, snr):
+        """
+        Plot residuals vs predicted sigma, colored by SNR.
+        Uses symmetric log scale for residuals of log-parameters.
+        
+        FIXED: Dynamic y-axis limits and ticks based on actual data range.
+        """
         n_params = len(self.model_params)
         fig, axes = plt.subplots(2, 4, figsize=(20, 10))
         axes = axes.flatten()
@@ -557,18 +583,129 @@ class CalibrationCheckCallback(Callback):
             
             snr_log = np.log10(np.clip(snr, vmin, vmax))
             
-            scatter = ax.scatter(sigma_vals, residuals, c=snr_log, cmap=cmap,
-                               alpha=0.5, s=20, norm=norm)
-            
-            ax.axhline(0, color='red', linestyle='--', alpha=0.7)
-            
             if param_name in self.log_scale_params:
+                # === SYMMETRIC LOG SCALE for LOG PARAMETERS ===
+                
+                # Transform residuals: sign(r) * log10(|r| + epsilon)
+                epsilon = 1e-3
+                residuals_symlog = np.sign(residuals) * np.log10(np.abs(residuals) + epsilon)
+                
+                # Scatter plot with SNR coloring
+                scatter = ax.scatter(sigma_vals, residuals_symlog, c=snr_log, cmap=cmap,
+                                alpha=0.5, s=20, norm=norm)
+                
+                # Zero line
+                ax.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7)
+                
+                # ±1σ reference lines in transformed space
+                ref_1sigma_pos = np.log10(1.0 + epsilon)
+                ref_1sigma_neg = -np.log10(1.0 + epsilon)
+                ax.axhline(ref_1sigma_pos, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                ax.axhline(ref_1sigma_neg, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                
+                # === DYNAMIC Y-AXIS TICKS ===
+                # Get data range
+                y_min, y_max = residuals_symlog.min(), residuals_symlog.max()
+                y_range = y_max - y_min
+                
+                # Create candidate tick values (in original residual space)
+                candidate_values = []
+                for exp in range(-3, 3):  # 0.001 to 100
+                    base = 10.0 ** exp
+                    candidate_values.extend([
+                        -10 * base, -3 * base, -base, -0.3 * base, -0.1 * base,
+                        0.1 * base, 0.3 * base, base, 3 * base, 10 * base
+                    ])
+                candidate_values.append(0.0)
+                candidate_values = np.array(sorted(set(candidate_values)))
+                
+                # Transform to symlog space
+                tick_positions = np.sign(candidate_values) * np.log10(np.abs(candidate_values) + epsilon)
+                
+                # Filter to visible range with margin
+                margin = y_range * 0.1
+                visible_mask = (tick_positions >= y_min - margin) & (tick_positions <= y_max + margin)
+                
+                # Select ticks
+                filtered_positions = tick_positions[visible_mask]
+                filtered_values = candidate_values[visible_mask]
+                
+                # If too many ticks, subsample
+                if len(filtered_positions) > 10:
+                    stride = max(1, len(filtered_positions) // 8)
+                    indices = np.arange(0, len(filtered_positions), stride)
+                    filtered_positions = filtered_positions[indices]
+                    filtered_values = filtered_values[indices]
+                
+                # Ensure zero is included if in range
+                if y_min < 0 < y_max and 0.0 not in filtered_values:
+                    zero_symlog = 0.0
+                    insert_idx = np.searchsorted(filtered_positions, zero_symlog)
+                    filtered_positions = np.insert(filtered_positions, insert_idx, zero_symlog)
+                    filtered_values = np.insert(filtered_values, insert_idx, 0.0)
+                
+                # Set ticks
+                ax.set_yticks(filtered_positions)
+                
+                # Format labels
+                labels = []
+                for v in filtered_values:
+                    if v == 0:
+                        labels.append('0')
+                    elif abs(v) >= 1:
+                        labels.append(f'{v:+.0f}')
+                    elif abs(v) >= 0.1:
+                        labels.append(f'{v:+.1f}')
+                    elif abs(v) >= 0.01:
+                        labels.append(f'{v:+.2f}')
+                    else:
+                        labels.append(f'{v:+.3f}')
+                ax.set_yticklabels(labels, fontsize=8)
+                
+                # Set y-limits with margin
+                ax.set_ylim(y_min - margin, y_max + margin)
+                
+                # Log scale for x-axis (sigma)
                 ax.set_xscale('log')
+                
+                # Labels
+                ax.set_xlabel(f'Predicted σ_log({param_name})', fontsize=10)
+                ax.set_ylabel(f'Residual: Δlog({param_name})\n[symlog scale]', fontsize=10)
+                
+                # Add explanation text box
+                textstr = 'Y: sign(Δ)×log₁₀(|Δ|+ε)\nΔ = log(pred)−log(true)'
+                ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=7,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                
+            else:
+                # === STANDARD LINEAR PLOT for LINEAR PARAMETERS ===
+                
+                scatter = ax.scatter(sigma_vals, residuals, c=snr_log, cmap=cmap,
+                                alpha=0.5, s=20, norm=norm)
+                
+                # Zero line
+                ax.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7)
+                
+                # ±1σ reference (should contain ~68% of points ideally)
+                residual_std = np.std(residuals)
+                ax.axhline(residual_std, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                ax.axhline(-residual_std, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                
+                # Labels
+                ax.set_xlabel(f'Predicted σ_{param_name}', fontsize=10)
+                ax.set_ylabel(f'Residual: pred - true', fontsize=10)
+                
+                # Let matplotlib auto-scale for linear params
             
-            ax.set_xlabel(f'Predicted σ')
-            ax.set_ylabel(f'Residual (pred - true)')
             ax.set_title(f'{param_name}', fontsize=11, fontweight='bold')
             ax.grid(True, alpha=0.3)
+            
+            # Add colorbar to first plot only
+            if i == 0:
+                cbar = plt.colorbar(scatter, ax=ax, label='SNR')
+                cbar_ticks = [10, 15, 20, 30, 50]
+                cbar.set_ticks(np.log10(cbar_ticks))
+                cbar.set_ticklabels(cbar_ticks)
         
         for i in range(n_params, len(axes)):
             axes[i].axis('off')
@@ -617,3 +754,298 @@ class CalibrationCheckCallback(Callback):
                           f"{z_mean_bin:>8.2f}  {z_std_bin:>8.2f}  (n={n})")
         
         print(f"{'='*100}\n")
+
+    def _plot_residuals_vs_true_symlog_old(self, results, epoch):
+            """
+            Plot residuals vs true values with symmetric log scaling for log-parameters.
+            
+            FIXED: Dynamic y-axis limits and ticks based on actual data range.
+            """
+            n_params = len(self.model_params)
+            fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+            axes = axes.flatten()
+            
+            for i, param_name in enumerate(self.model_params):
+                if i >= len(axes):
+                    break
+                
+                ax = axes[i]
+                
+                true_vals = results[param_name]['true_values_orig']
+                residuals = results[param_name]['residuals_orig']
+                
+                # Subsample if too many points
+                n_samples = len(true_vals)
+                if n_samples > 2000:
+                    indices = np.random.choice(n_samples, 2000, replace=False)
+                    true_vals = true_vals[indices]
+                    residuals = residuals[indices]
+                
+                if param_name in self.log_scale_params:
+                    # === SYMMETRIC LOG SCALE for LOG PARAMETERS ===
+                    
+                    epsilon = 1e-3
+                    residuals_symlog = np.sign(residuals) * np.log10(np.abs(residuals) + epsilon)
+                    
+                    scatter = ax.scatter(true_vals, residuals_symlog, alpha=0.5, s=10, c='blue', edgecolors='none')
+                    
+                    # Zero line
+                    ax.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Perfect prediction')
+                    
+                    # ±1σ reference lines
+                    ref_1sigma_pos = np.log10(1.0 + epsilon)
+                    ref_1sigma_neg = -np.log10(1.0 + epsilon)
+                    ax.axhline(ref_1sigma_pos, color='orange', linestyle=':', linewidth=1.5, alpha=0.6, label='±1σ reference')
+                    ax.axhline(ref_1sigma_neg, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                    
+                    # === DYNAMIC Y-AXIS TICKS (same logic as above) ===
+                    y_min, y_max = residuals_symlog.min(), residuals_symlog.max()
+                    y_range = y_max - y_min
+                    
+                    # Create candidate tick values
+                    candidate_values = []
+                    for exp in range(-3, 3):
+                        base = 10.0 ** exp
+                        candidate_values.extend([
+                            -10 * base, -3 * base, -base, -0.3 * base, -0.1 * base,
+                            0.1 * base, 0.3 * base, base, 3 * base, 10 * base
+                        ])
+                    candidate_values.append(0.0)
+                    candidate_values = np.array(sorted(set(candidate_values)))
+                    
+                    tick_positions = np.sign(candidate_values) * np.log10(np.abs(candidate_values) + epsilon)
+                    
+                    margin = y_range * 0.1
+                    visible_mask = (tick_positions >= y_min - margin) & (tick_positions <= y_max + margin)
+                    
+                    filtered_positions = tick_positions[visible_mask]
+                    filtered_values = candidate_values[visible_mask]
+                    
+                    # Subsample if too many
+                    if len(filtered_positions) > 10:
+                        stride = len(filtered_positions) // 8
+                        indices = np.arange(0, len(filtered_positions), stride)
+                        filtered_positions = filtered_positions[indices]
+                        filtered_values = filtered_values[indices]
+                    
+                    # Ensure zero is included
+                    if y_min < 0 < y_max:
+                        zero_symlog = 0.0
+                        if zero_symlog not in filtered_positions:
+                            insert_idx = np.searchsorted(filtered_positions, zero_symlog)
+                            filtered_positions = np.insert(filtered_positions, insert_idx, zero_symlog)
+                            filtered_values = np.insert(filtered_values, insert_idx, 0.0)
+                    
+                    ax.set_yticks(filtered_positions)
+                    
+                    labels = []
+                    for v in filtered_values:
+                        if v == 0:
+                            labels.append('0')
+                        elif abs(v) >= 1:
+                            labels.append(f'{v:+.0f}')
+                        elif abs(v) >= 0.1:
+                            labels.append(f'{v:+.1f}')
+                        elif abs(v) >= 0.01:
+                            labels.append(f'{v:+.2f}')
+                        else:
+                            labels.append(f'{v:+.3f}')
+                    ax.set_yticklabels(labels, fontsize=8)
+                    
+                    ax.set_ylim(y_min - margin, y_max + margin)
+                    
+                    # Log scale for x-axis
+                    ax.set_xscale('log')
+                    
+                    ax.set_xlabel(f'True {param_name} (log scale)', fontsize=10)
+                    ax.set_ylabel(f'Residual: Δlog({param_name})\n[symlog scale]', fontsize=10)
+                    ax.set_title(f'{param_name} (log-parameter)', fontsize=11, fontweight='bold')
+                    
+                    textstr = 'Y: sign(Δ)×log₁₀(|Δ|+ε)\nΔ = log(pred)−log(true)'
+                    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=7,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    
+                else:
+                    # === STANDARD LINEAR PLOT ===
+                    
+                    scatter = ax.scatter(true_vals, residuals, alpha=0.5, s=10, c='blue', edgecolors='none')
+                    
+                    ax.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Perfect prediction')
+                    
+                    residual_std = np.std(residuals)
+                    ax.axhline(residual_std, color='orange', linestyle=':', linewidth=1.5, alpha=0.6, label=f'±1σ = ±{residual_std:.3f}')
+                    ax.axhline(-residual_std, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                    
+                    ax.set_xlabel(f'True {param_name}', fontsize=10)
+                    ax.set_ylabel(f'Residual: pred - true', fontsize=10)
+                    ax.set_title(f'{param_name} (linear parameter)', fontsize=11, fontweight='bold')
+                
+                ax.legend(fontsize=7, loc='best')
+                ax.grid(True, alpha=0.3)
+            
+            for i in range(n_params, len(axes)):
+                axes[i].axis('off')
+            
+            plt.suptitle(f'Epoch {epoch+1}: Residuals vs True Values (Symlog for Log-Params)', 
+                        fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, f'E{epoch+1}_residuals_vs_true.png'), 
+                    dpi=150, bbox_inches='tight')
+            plt.close()
+
+    def _plot_residuals_vs_true_symlog(self, results, epoch):
+        """
+        Plot residuals vs true values.
+        
+        CRITICAL FIX: For log-parameters, residuals are ALREADY Δlog(X), 
+        so plot them on a LINEAR scale, not symlog!
+        """
+        n_params = len(self.model_params)
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        axes = axes.flatten()
+        
+        for i, param_name in enumerate(self.model_params):
+            if i >= len(axes):
+                break
+            
+            ax = axes[i]
+            
+            true_vals = results[param_name]['true_values_orig']
+            residuals = results[param_name]['residuals_orig']
+            
+            # Subsample if too many points
+            n_samples = len(true_vals)
+            if n_samples > 2000:
+                indices = np.random.choice(n_samples, 2000, replace=False)
+                true_vals = true_vals[indices]
+                residuals = residuals[indices]
+            
+            if param_name in self.log_scale_params:
+                # === LOG PARAMETERS: Residuals are ALREADY Δlog(X) ===
+                # No transformation needed! Just plot directly.
+                
+                scatter = ax.scatter(true_vals, residuals, alpha=0.5, s=10, c='blue', edgecolors='none')
+                
+                # Zero line
+                ax.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Perfect prediction')
+                
+                # ±1σ reference lines (in log-space)
+                # For well-calibrated predictions, ~68% should be within ±1
+                ax.axhline(1.0, color='orange', linestyle=':', linewidth=1.5, alpha=0.6, label='±1 in log-space')
+                ax.axhline(-1.0, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                
+                # Additional reference lines
+                ax.axhline(0.3, color='orange', linestyle=':', linewidth=1, alpha=0.3)
+                ax.axhline(-0.3, color='orange', linestyle=':', linewidth=1, alpha=0.3)
+                
+                # Log scale for x-axis (true values in physical space)
+                ax.set_xscale('log')
+                
+                # LINEAR scale for y-axis (residuals already in log-space)
+                ax.set_xlabel(f'True {param_name} (physical scale)', fontsize=10)
+                ax.set_ylabel(f'Residual: log₁₀(pred) - log₁₀(true)', fontsize=10)
+                ax.set_title(f'{param_name} (log-parameter)', fontsize=11, fontweight='bold')
+                
+                # Add explanation
+                textstr = f'Y-axis: Δlog₁₀({param_name})\n(already in log-space)'
+                ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=7,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                
+            else:
+                # === LINEAR PARAMETERS ===
+                
+                scatter = ax.scatter(true_vals, residuals, alpha=0.5, s=10, c='blue', edgecolors='none')
+                
+                ax.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Perfect prediction')
+                
+                residual_std = np.std(residuals)
+                ax.axhline(residual_std, color='orange', linestyle=':', linewidth=1.5, alpha=0.6, label=f'±1σ = ±{residual_std:.3f}')
+                ax.axhline(-residual_std, color='orange', linestyle=':', linewidth=1.5, alpha=0.6)
+                
+                ax.set_xlabel(f'True {param_name}', fontsize=10)
+                ax.set_ylabel(f'Residual: pred - true', fontsize=10)
+                ax.set_title(f'{param_name} (linear parameter)', fontsize=11, fontweight='bold')
+            
+            ax.legend(fontsize=7, loc='best')
+            ax.grid(True, alpha=0.3)
+        
+        for i in range(n_params, len(axes)):
+            axes[i].axis('off')
+        
+        plt.suptitle(f'Epoch {epoch+1}: Residuals vs True Values', 
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, f'E{epoch+1}_residuals_vs_true.png'), 
+                dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+    def _plot_residuals_vs_sigma_by_snr(self, results, epoch, snr):
+        """
+        Plot residuals vs predicted sigma, colored by SNR.
+        
+        CRITICAL FIX: For log-parameters, residuals are ALREADY Δlog(X),
+        so plot them on a LINEAR scale, not symlog!
+        """
+        n_params = len(self.model_params)
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        axes = axes.flatten()
+        
+        vmin, vmax = 10, 50
+        norm = Normalize(vmin=np.log10(vmin), vmax=np.log10(vmax))
+        cmap = plt.cm.viridis
+        
+        for i, param_name in enumerate(self.model_params):
+            if i >= len(axes):
+                break
+            
+            ax = axes[i]
+            
+            residuals = results[param_name]['residuals_orig']
+            sigma_vals = results[param_name]['sigma_orig']
+            # --- START: FIX ---
+            # Filter out NaN residuals that may have been created for log-params with zero true values
+            valid_mask = ~np.isnan(residuals)
+            
+            snr_log = np.log10(np.clip(snr[valid_mask], vmin, vmax))
+            
+            scatter = ax.scatter(sigma_vals[valid_mask], residuals[valid_mask], c=snr_log, cmap=cmap,
+                               alpha=0.5, s=20, norm=norm)
+            # --- END: FIX ---
+
+            ax.axhline(0, color='red', linestyle='--', alpha=0.7)
+            
+            # --- START: MODIFIED AXIS SCALING AND LABELING ---
+            if param_name in self.log_scale_params:
+                # For log-params, sigma_orig can span orders of magnitude, so log scale is better.
+                ax.set_xscale('log')
+                # The y-axis is now relative error, which is symmetric around zero, so it should be linear.
+                ax.set_ylabel('Relative Residual ((pred-true)/true)')
+                # Use a symmetric log scale for y-axis if residuals span many orders of magnitude
+                # For now, a linear scale is usually best for relative error.
+            else:
+                # For linear-params, a linear scale is usually fine for both.
+                ax.set_ylabel('Residual (pred - true)')
+            # --- END: MODIFIED AXIS SCALING AND LABELING ---
+
+            ax.set_xlabel(f'Predicted σ')
+            ax.set_title(f'{param_name}', fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            
+            if i == 0:
+                cbar = plt.colorbar(scatter, ax=ax, label='SNR')
+                cbar_ticks = [10, 15, 20, 30, 50]
+                cbar.set_ticks(np.log10(cbar_ticks))
+                cbar.set_ticklabels(cbar_ticks)
+        
+        for i in range(n_params, len(axes)):
+            axes[i].axis('off')
+        
+        plt.suptitle(f'Epoch {epoch+1}: Residuals vs Sigma (by SNR)', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, f'E{epoch+1}_residuals_vs_sigma_snr.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+    
+
+    

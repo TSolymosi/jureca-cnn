@@ -1,6 +1,7 @@
 import sys
 import os
 import inspect
+import re
 
 # --- Force Python to find the 'src' package correctly ---
 # Get the absolute path of the current script (train.py)
@@ -66,10 +67,15 @@ from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
+
+
+
 # --- Import the custom modules from your project's source directory ---
 from src.models.lightning_resnet import LitResNetMDN
 from src.data.fits_datamodule import FitsDataModule
 from src.callbacks.prediction_plot_callback import PredictionPlotCallback
+
+#from src.callbacks.two_stage_callback import TwoStageMDNTraining
 
 
 # The `@hydra.main` decorator turns this function into a Hydra-configurable application.
@@ -100,14 +106,9 @@ def main(cfg: DictConfig):
     # The `FitsDataModule` is instantiated using the configuration found in `cfg.data`.
     # Hydra automatically maps the key-value pairs in the YAML to the arguments of the class `__init__`.
     datamodule = FitsDataModule(cfg.data)
-    #datamodule.setup() # This is typically called automatically by the Trainer, so manual calls are often not needed.
 
     # --- Get dataset properties for the model ---
-    # This section was likely used to pass dataset-specific properties (like standard deviation for weighting)
-    # to the model. It's currently disabled, and the model now fetches this information internally
-    # from the datamodule in the `on_fit_start` hook.
-    #dataset_ref = datamodule.get_dataset_reference()
-    #std_weights = dataset_ref.scaler_stds
+    # This is handled automatically by the model's `on_fit_start` hook now.
     std_weights = None
 
     # --- Instantiate Model ---
@@ -118,20 +119,17 @@ def main(cfg: DictConfig):
         model_cfg=cfg.model,
         optim_cfg=cfg.optim,
         training_cfg=cfg.trainer,
+        strategy_cfg=cfg.training_strategy,
         std_weights=std_weights
     )
 
     # --- START OF NEW DIAGNOSTIC BLOCK ---
-    # We will add this check to get the ground truth about the model object.
-    
-
     @rank_zero_only
     def run_diagnostics(model_object):
         print("\n" + "="*80)
         print(" " * 25 + "RUNTIME OBJECT DIAGNOSTICS")
         print("="*80)
         
-        # 1. Find out which file this class was actually loaded from.
         try:
             class_file = inspect.getfile(model_object.__class__)
             print(f"[INFO] The 'LitResNetMDN' class was loaded from file:")
@@ -141,7 +139,6 @@ def main(cfg: DictConfig):
         
         print("-" * 80)
         
-        # 2. Inspect the signature of the on_validation_epoch_end method on the live object.
         try:
             hook_method = model_object.on_validation_epoch_end
             signature = inspect.getfullargspec(hook_method)
@@ -156,17 +153,16 @@ def main(cfg: DictConfig):
     # --- END OF NEW DIAGNOSTIC BLOCK ---
 
     # --- Instantiate Callbacks ---
+    callback_list = []
+
+    
+
     # Callbacks are objects that can perform actions at various stages of training (e.g., at the end of an epoch).
     # This loop dynamically instantiates all callbacks defined in the `cfg.callbacks` section of the config.
-    callback_list = []
     for name, cb_cfg in cfg.callbacks.items():
-        # `_target_` is a special key in Hydra configs that specifies the Python class to instantiate.
         target = cb_cfg.get("_target_", "")
         print_rank0(f"Instantiating callback: {name} with target {target}")
 
-        # This is a special case. The PredictionPlotCallback needs access to `model_params` and `log_scale_params`
-        # which are defined in the data section of the config. This code block manually injects them during
-        # instantiation, as the callback doesn't have direct access to `cfg.data`.
         if "PredictionPlotCallback" in target:
             cb = instantiate(
                 cb_cfg,
@@ -174,61 +170,120 @@ def main(cfg: DictConfig):
                 log_scale_params=cfg.data.log_scale_params
             )
         else:
-            # For all other callbacks, instantiate them directly from their config.
             cb = instantiate(cb_cfg)
         callback_list.append(cb)
 
-    # Log the list of active callbacks on the main process.
     rank_zero_info(f"Using callbacks: {[type(cb).__name__ for cb in callback_list]}")
 
     # --- Instantiate Trainer ---
     # The PyTorch Lightning `Trainer` orchestrates the entire training process.
-    # It is configured using the instantiated callbacks and the settings from `cfg.trainer`.
-    # `num_sanity_val_steps=0` disables the initial validation sanity check.
     trainer = Trainer(
         callbacks=callback_list,
         **cfg.trainer,
         num_sanity_val_steps=0,
+        sync_batchnorm=True,
     )
 
     # --- Run Training, Validation, or Testing ---
-    # This logic allows you to control the trainer's behavior from the command line or config file.
-    ckpt_path = cfg.get("ckpt_path", None)  # Path to a specific checkpoint to load.
-    mode = cfg.get("mode", "train")          # The desired mode: "train", "validate", or "test".
-    load_id = cfg.get("load_id", None)     # Get the load_id from the config
+    ckpt_path = cfg.get("ckpt_path", None)
+    mode = cfg.get("mode", "train")
+    load_id = cfg.get("load_id", None)
+
+    
 
     if ckpt_path is None and load_id is not None:
-        # If a load_id is provided but not a direct ckpt_path, construct the path.
-        # This assumes your outputs are saved in a standard Hydra output directory.
-        # We look for the 'last.ckpt' file, which is saved by the ModelCheckpoint callback.
-        
-        # The path depends on your hydra output structure. It's often 'outputs/job_name/job_id/'.
-        # Assuming folder_name is used, the structure would be 'outputs/folder_name/load_id/'.
         folder_name = cfg.get("folder_name", "default_folder")
+        ckpt_dir = os.path.join("outputs", folder_name, str(load_id), "checkpoints")
         
-        potential_path = os.path.join("outputs", folder_name, str(load_id), "checkpoints", "last.ckpt")
-        
-        if os.path.exists(potential_path):
-            ckpt_path = potential_path
-            rank_zero_info(f"Found checkpoint for load_id '{load_id}' at: {ckpt_path}")
+        best_ckpt = None
+        best_loss = float("inf")
+
+        if os.path.isdir(ckpt_dir):
+            for fname in os.listdir(ckpt_dir):
+                # Match epoch_XXX-val_loss_6.1234.ckpt
+                m = re.match(r"epoch_\d+-val_loss_([-+]?[0-9]*\.?[0-9]+)\.ckpt$", fname)
+                if m:
+                    loss = float(m.group(1))
+                    if loss < best_loss:
+                        best_loss = loss
+                        best_ckpt = os.path.join(ckpt_dir, fname)
+
+        if best_ckpt:
+            ckpt_path = best_ckpt
+            rank_zero_info(f"Selected best checkpoint: {ckpt_path} (val_loss={best_loss})")
         else:
-            rank_zero_info(f"WARNING: load_id '{load_id}' was provided, but no checkpoint found at '{potential_path}'. Starting from scratch.")
+            last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
+            if os.path.exists(last_ckpt):
+                ckpt_path = last_ckpt
+                rank_zero_info(f"No best-loss checkpoint found. Using last checkpoint: {ckpt_path}")
+            else:
+                rank_zero_info(
+                    f"WARNING: load_id '{load_id}' was provided, but no checkpoint found. Starting from scratch."
+                )
 
     if mode == "train":
-        # Starts the main training and validation loop. Can resume from `ckpt_path` if provided.
         trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
-        # You could optionally run a final validation on the best saved checkpoint after training.
-        # trainer.validate(model, datamodule=datamodule, ckpt_path="best")
+        
+        rank_zero_info("\n" + "="*80)
+        rank_zero_info(" " * 20 + "TRAINING COMPLETE. RUNNING FINAL EVALUATION...")
+        rank_zero_info("="*80 + "\n")
+        
+        best_ckpt_path = None
+        for cb in trainer.callbacks:
+            if isinstance(cb, ModelCheckpoint):
+                best_ckpt_path = cb.best_model_path
+                break
+        
+        if best_ckpt_path and os.path.exists(best_ckpt_path):
+            rank_zero_info(f"Found best checkpoint at: {best_ckpt_path}")
+            trainer.test(model, dataloaders=datamodule.val_dataloader(), ckpt_path=best_ckpt_path)
+        else:
+            rank_zero_info("WARNING: Could not find best checkpoint path. Skipping final test.")
+        
+        if trainer.is_global_zero:
+            if hasattr(model, "_test_cache") and model._test_cache:
+                final_results = model._test_cache
+                dataset_ref = datamodule.get_dataset_reference()
+                
+                targets_original = dataset_ref.inverse_transform_labels(final_results["targets"])
+                
+                df_data = {}
+                param_names = dataset_ref.model_params
+                
+                if "snr" in final_results:
+                    df_data['snr'] = final_results["snr"].numpy()
+                
+                for i, name in enumerate(param_names):
+                    df_data[f"true_{name}"] = targets_original[:, i].numpy()
+
+                if "sigmas" in final_results and final_results["sigmas"] is not None:
+                    preds_original, sigmas_original = dataset_ref.inverse_transform_labels_with_uncertainty(
+                        final_results["preds"], final_results["sigmas"]
+                    )
+                    for i, name in enumerate(param_names):
+                        df_data[f"pred_{name}"] = preds_original[:, i].numpy()
+                        df_data[f"sigma_{name}"] = sigmas_original[:, i].numpy()
+                else:
+                    preds_original = dataset_ref.inverse_transform_labels(final_results["preds"])
+                    for i, name in enumerate(param_names):
+                        df_data[f"pred_{name}"] = preds_original[:, i].numpy()
+                
+                import pandas as pd
+                df = pd.DataFrame(df_data)
+
+                output_path = "final_predictions.csv"
+                df.to_csv(output_path, index=False)
+                rank_zero_info(f"Saved final predictions (including SNR) to: {os.getcwd()}/{output_path}")
+
+            else:
+                rank_zero_info("WARNING: Final evaluation did not produce a test cache. Skipping CSV save.")
+
     elif mode == "validate":
-        # Runs a single validation epoch using the provided checkpoint.
         trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt_path)
     elif mode == "test":
-        # Runs a single test epoch using the provided checkpoint.
         trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
 
-    # The return value is often used by Hydra's hyperparameter optimization plugins (sweepers).
-    # It reports the final validation loss as the metric for evaluating the success of a run.
-    return trainer.callback_metrics["val/loss"].item()
+    return trainer.callback_metrics.get("val/loss", -1.0)
 
 if __name__ == "__main__":
     # This is the standard entry point for a Python script.

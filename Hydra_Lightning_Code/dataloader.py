@@ -15,6 +15,8 @@ import functools
 import json
 from typing import Literal
 from astropy.io import fits as _fits
+from multiprocessing import Pool
+from functools import partial
 
 # Flush prints immediately
 print = functools.partial(print, flush=True)
@@ -62,8 +64,8 @@ class FitsDataset(data.Dataset):
         use_local_nvme=True,
         load_preprocessed=False,
         preprocessed_dir='/p/scratch/pasta/CNN/Processed_Data/processed_data',
-        model_params=["D", "L", "ro", "rr", "p", "Tlow", "NCH3CN", "plummer_shape"],
-        log_scale_params=["D", "L", "NCH3CN"],
+        model_params=["M", "D", "L", "ro", "p", "Tlow", "NCH3CN"],
+        log_scale_params=["M", "D", "L", "NCH3CN"],
         # ------------- CPU-SIDE NOISE/MASKING — DEPRECATED -------------
         # use_cauchy_noise=False,
         # cauchy_mu=0.003,
@@ -73,6 +75,8 @@ class FitsDataset(data.Dataset):
         # snr_threshold=5.0,
         # ---------------------------------------------------------------
         mask_13co=True,
+        labels_cache_dir=None,  # NEW: Where to save/load label cache
+        num_workers_extract=32,  # NEW: Parallel extraction workers
     ):
         self.wavelength_stride = wavelength_stride
         self.load_preprocessed = load_preprocessed
@@ -98,6 +102,20 @@ class FitsDataset(data.Dataset):
         # self.snr_threshold = snr_threshold
 
         self.mask_13co = mask_13co
+        self.labels_cache_dir = labels_cache_dir
+        self.num_workers_extract = num_workers_extract
+
+        # Header key mapping
+        self.header_key_map = {
+            'M': 'mass',
+            'D': 'dens',
+            'L': 'lum',
+            'ro': 'ro',
+            'p': 'prho',
+            'Tlow': 'Tlow',
+            'NCH3CN': 'abunch3cn',
+            'plummer_shape': None  # Computed
+        }
 
         if self.load_preprocessed:
             self.data_dir = os.path.join(preprocessed_dir, "data_100")
@@ -112,6 +130,13 @@ class FitsDataset(data.Dataset):
             if use_local_nvme and os.path.exists("/local/nvme"):
                 slurm_id = os.environ.get("SLURM_JOB_ID", "nojob")
                 self.fits_dir = f"/local/nvme/{slurm_id}_fits_data"
+
+                # Setup label cache directory on local NVMe
+                if labels_cache_dir is None:
+                    self.labels_cache_dir = f"/local/nvme/{slurm_id}_labels_cache"
+                else:
+                    self.labels_cache_dir = labels_cache_dir
+
                 if not os.path.exists(self.fits_dir):
                     print_rank0(f"Copying FITS files to local storage: {self.fits_dir}")
                     os.makedirs(self.fits_dir, exist_ok=True)
@@ -125,6 +150,10 @@ class FitsDataset(data.Dataset):
                     print_rank0(f"Local NVMe path already exists: {self.fits_dir}")
             else:
                 self.fits_dir = fits_dir
+                if labels_cache_dir is None:
+                    self.labels_cache_dir = os.path.join(fits_dir, ".labels_cache")
+                else:
+                    self.labels_cache_dir = labels_cache_dir
 
             if file_list is not None:
                 self.fits_files = file_list
@@ -154,7 +183,8 @@ class FitsDataset(data.Dataset):
                 self._chan_mask = (freq >= FREQ_13CO_HZ - half_w) & (freq <= FREQ_13CO_HZ + half_w)
 
             print_rank0("Extracting labels from FITS filenames...")
-            self.labels = np.array([self.extract_label(os.path.basename(f)) for f in self.fits_files])
+            #self.labels = np.array([self.extract_label(os.path.basename(f)) for f in self.fits_files])
+            self.labels = self._extract_labels_with_cache()
 
     def _copy_selected_files(self, file_list):
         for src_path in file_list:
@@ -224,72 +254,215 @@ class FitsDataset(data.Dataset):
                 label.append(label_dict[param])
         return label
     
-    def extract_label(self, filename):
-        """
-        Extract labels from FITS header instead of filename.
-        
-        Maps FITS header keys to model parameter names.
-        """
-        # Mapping from model parameter names to FITS header keys
-        header_key_map = {
-            'M': 'mass',           # New parameter!
-            'D': 'dens',
-            'L': 'lum',
-            'ro': 'ro',
-            'p': 'prho',
-            'Tlow': 'Tlow',
-            'NCH3CN': 'abunch3cn',
-            'plummer_shape': None  # Computed from p and ro (not rr anymore!)
-        }
-        
-        # Get full path to FITS file
-        fits_path = filename if os.path.isabs(filename) else os.path.join(self.fits_dir, filename)
-        
-        # Read FITS header
-        try:
-            with fits.open(fits_path, memmap=True) as hdul:
-                header = hdul[0].header
-                
-                # Extract thermal_params from COMMENT section
-                # The header stores parameters as JSON in COMMENT cards
-                thermal_params = self._extract_thermal_params_from_header(header)
-                
-        except Exception as e:
-            print(f"[ERROR] Failed to read header from {filename}: {e}")
-            raise
-        
-        # Build label array
-        label = []
-        for param in self.model_params:
-            if param == "plummer_shape":
-                # Compute plummer_shape = p * log10(ro)
-                # Note: Changed from p * log10(rr) to p * log10(ro)
-                p_val = thermal_params.get('prho', thermal_params.get('p'))
-                ro_val = thermal_params.get('ro')
-                if p_val is None or ro_val is None:
-                    raise ValueError(f"Cannot compute plummer_shape: missing p or ro in {filename}")
-                label.append(p_val * np.log10(ro_val))
-            else:
-                # Look up parameter in thermal_params
-                header_key = header_key_map.get(param)
-                if header_key is None:
-                    raise ValueError(f"Unknown parameter: {param}")
-                
-                value = thermal_params.get(header_key)
-                if value is None:
-                    raise ValueError(f"Parameter {param} (header key: {header_key}) not found in {filename}")
-                
-                label.append(float(value))
-        
-        return label
+    
 
-    def _extract_thermal_params_from_header(self, header):
+    def _extract_labels_with_cache(self):
         """
-        Extract parameters from FITS header COMMENT section.
+        Extract labels with intelligent caching.
         
-        The header contains a JSON-like structure in COMMENT cards.
-        We need to parse it to extract thermal_params.
+        SIMPLIFIED: Only rank 0 does extraction, others just wait and load.
         """
+        cache_path = self._get_cache_path()
+        
+        # Rank 0: Extract or load cache
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            if os.path.exists(cache_path):
+                print_rank0(f"Loading cached labels from: {cache_path}")
+                try:
+                    labels = np.load(cache_path)
+                    
+                    # Verify cache integrity
+                    expected_shape = (len(self.fits_files), len(self.model_params))
+                    if labels.shape == expected_shape:
+                        print_rank0(f"Successfully loaded {len(labels)} labels from cache")
+                        # Don't call barrier here - we're in multiprocessing context
+                        return labels
+                    else:
+                        print_rank0(f"[WARNING] Cache shape mismatch: {labels.shape} vs {expected_shape}. Re-extracting.")
+                except Exception as e:
+                    print_rank0(f"[WARNING] Failed to load cache: {e}. Re-extracting.")
+            
+            # Cache doesn't exist or is invalid: extract labels
+            print_rank0(f"Extracting labels from {len(self.fits_files)} FITS files...")
+            print_rank0(f"Using {self.num_workers_extract} parallel workers")
+            
+            labels = self._extract_labels_parallel()
+            
+            # Save cache
+            os.makedirs(self.labels_cache_dir, exist_ok=True)
+            np.save(cache_path, labels)
+            print_rank0(f"Saved label cache to: {cache_path}")
+            
+            return labels
+        
+        else:
+            # Other ranks: Wait for rank 0 to finish, then load
+            print(f"[Rank {dist.get_rank()}] Waiting for rank 0 to extract/cache labels...")
+            
+            # Poll until cache file exists (created by rank 0)
+            import time
+            max_wait_seconds = 3600  # 1 hour timeout
+            wait_interval = 5  # Check every 5 seconds
+            elapsed = 0
+            
+            while not os.path.exists(cache_path):
+                time.sleep(wait_interval)
+                elapsed += wait_interval
+                
+                if elapsed >= max_wait_seconds:
+                    raise RuntimeError(f"Rank {dist.get_rank()} timed out waiting for label cache")
+                
+                if elapsed % 60 == 0:  # Print every minute
+                    print(f"[Rank {dist.get_rank()}] Still waiting for labels... ({elapsed}s elapsed)")
+            
+            # Cache file exists, load it
+            print(f"[Rank {dist.get_rank()}] Loading labels from cache...")
+            labels = np.load(cache_path)
+            print(f"[Rank {dist.get_rank()}] Loaded {len(labels)} labels")
+            
+            return labels
+
+    def _get_cache_path(self):
+        """
+        Generate unique cache filename based on dataset configuration.
+        
+        This ensures different parameter combinations get different caches.
+        """
+        import hashlib
+        
+        # Create a unique identifier from the configuration
+        config_str = (
+            f"params={','.join(self.model_params)}_"
+            f"log={','.join(self.log_scale_params)}_"
+            f"nfiles={len(self.fits_files)}"
+        )
+        
+        # Hash the file list to detect changes
+        file_list_str = ''.join(sorted([os.path.basename(f) for f in self.fits_files]))
+        file_hash = hashlib.md5(file_list_str.encode()).hexdigest()[:8]
+        
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+        
+        cache_filename = f"labels_{config_hash}_{file_hash}.npy"
+        cache_path = os.path.join(self.labels_cache_dir, cache_filename)
+        
+        return cache_path
+
+    def _extract_labels_parallel(self):
+        """Extract labels using parallel processing."""
+        from multiprocessing import Pool
+        from functools import partial
+        
+        # Prepare extraction function
+        extract_func = partial(
+            self._extract_one_label_static,
+            fits_dir=self.fits_dir,
+            model_params=self.model_params,
+            header_key_map=self.header_key_map
+        )
+        
+        # Use progress bar if tqdm is available
+        try:
+            from tqdm import tqdm
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+        
+        labels = []
+        with Pool(self.num_workers_extract) as pool:
+            if use_tqdm:
+                labels = list(tqdm(
+                    pool.imap(extract_func, self.fits_files),
+                    total=len(self.fits_files),
+                    desc="Extracting labels"
+                ))
+            else:
+                for i, label in enumerate(pool.imap(extract_func, self.fits_files)):
+                    labels.append(label)
+                    if (i + 1) % 1000 == 0:
+                        print_rank0(f"Processed {i+1}/{len(self.fits_files)} files")
+        
+        return np.array(labels)
+    
+    @staticmethod
+    def _extract_one_label_static(filename, fits_dir, model_params, header_key_map):
+        """
+        Static method for extracting one label (for parallel execution).
+        """
+        fits_path = filename if os.path.isabs(filename) else os.path.join(fits_dir, filename)
+        
+        try:
+            with _fits.open(fits_path, memmap=True) as hdul:
+                header = hdul[0].header
+                thermal_params = FitsDataset._extract_thermal_params_from_header_static(header)
+            
+            # Build label array
+            label = []
+            for param in model_params:
+                if param == "plummer_shape":
+                    # Try multiple possible names for p
+                    p_val = thermal_params.get('prho') or thermal_params.get('p')
+                    ro_val = thermal_params.get('ro') or thermal_params.get('r_out')
+                    
+                    if p_val is None or ro_val is None:
+                        raise ValueError(
+                            f"Cannot compute plummer_shape: p={p_val}, ro={ro_val}. "
+                            f"Available keys: {list(thermal_params.keys())}"
+                        )
+                    label.append(float(p_val) * np.log10(float(ro_val)))
+                else:
+                    # Look up the header key
+                    header_key = header_key_map.get(param)
+                    if header_key is None:
+                        raise ValueError(f"Unknown parameter: {param}")
+                    
+                    # Try to find the value (with fallbacks for name variations)
+                    value = thermal_params.get(header_key)
+                    
+                    # If not found, try alternative names
+                    if value is None:
+                        # Define fallback names
+                        fallback_names = {
+                            'mass': ['mass', 'M', 'stellar_mass'],
+                            'dens': ['dens', 'D', 'density'],
+                            'lum': ['lum', 'L', 'luminosity'],
+                            'ro': ['ro', 'r_out', 'outer_radius'],
+                            'prho': ['prho', 'p', 'rho_power'],
+                            'Tlow': ['Tlow', 'T_low', 'lower_temp'],
+                            'abunch3cn': ['abunch3cn', 'NCH3CN', 'ch3cn_abundance'],
+                        }
+                        
+                        if header_key in fallback_names:
+                            for alt_name in fallback_names[header_key]:
+                                value = thermal_params.get(alt_name)
+                                if value is not None:
+                                    break
+                    
+                    if value is None:
+                        raise ValueError(
+                            f"Parameter {param} (header key: {header_key}) not found. "
+                            f"Available keys: {list(thermal_params.keys())}"
+                        )
+                    
+                    label.append(float(value))
+            
+            return label
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to extract label from {os.path.basename(filename)}: {e}")
+            # Return NaNs to indicate failure
+            return [np.nan] * len(model_params)
+    
+    @staticmethod
+    def _extract_thermal_params_from_header_static(header):
+        """
+        Extract thermal parameters from FITS header.
+        
+        Extracts from TOP-LEVEL JSON, not from nested thermal_params.
+        """
+        import re
+        import json
+        
         # Collect all COMMENT cards
         comments = []
         for card in header.cards:
@@ -300,41 +473,64 @@ class FitsDataset(data.Dataset):
         comment_text = ' '.join(comments)
         
         # Try to parse as JSON
-        # The header has: COMMENT { ... COMMENT     "mass": 10.01467, ... COMMENT }
         try:
-            import json
-            import re
-            
-            # Extract the JSON block between outermost braces
-            # Remove "COMMENT" prefixes that might be embedded
-            json_text = re.search(r'\{.*\}', comment_text, re.DOTALL)
-            if json_text:
-                json_str = json_text.group(0)
-                # Parse JSON
-                params = json.loads(json_str)
+            # Find the JSON block
+            json_match = re.search(r'\{.*\}', comment_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
                 
-                # If thermal_params is nested, extract it
-                if 'thermal_params' in params:
-                    return params['thermal_params']
-                else:
-                    return params
-            else:
-                raise ValueError("Could not find JSON structure in COMMENT")
-        
+                # Parse JSON
+                full_params = json.loads(json_str)
+                
+                # CRITICAL FIX: Extract ALL top-level parameters
+                # Don't go into thermal_params - that doesn't have dens!
+                params = {}
+                for key, value in full_params.items():
+                    # Skip nested dicts and metadata fields
+                    if isinstance(value, dict):
+                        continue
+                    # Skip non-numeric metadata
+                    if key in ['finished', 'error', 'full_finished', 'full_error']:
+                        continue
+                    
+                    # Add numeric parameters
+                    if isinstance(value, (int, float)):
+                        params[key] = value
+                    elif isinstance(value, str):
+                        # Try to parse as float if it's a number string
+                        try:
+                            params[key] = float(value)
+                        except ValueError:
+                            pass  # Skip non-numeric strings
+                
+                return params
+                
+        except json.JSONDecodeError as e:
+            print(f"[WARNING] JSON parse failed: {e}")
         except Exception as e:
-            print(f"[WARNING] Failed to parse thermal_params from header: {e}")
-            
-            # Fallback: Parse individual lines
-            # Look for patterns like: COMMENT     "mass": 10.01467,
-            params = {}
-            for comment in comments:
-                match = re.search(r'"(\w+)":\s*([\d.e+-]+)', comment)
-                if match:
-                    key = match.group(1)
-                    value = float(match.group(2))
+            print(f"[WARNING] Unexpected error during JSON parse: {e}")
+        
+        # Fallback: Parse individual lines
+        print("[WARNING] Falling back to line-by-line parameter extraction")
+        params = {}
+        
+        for comment in comments:
+            # Match patterns like: COMMENT     "dens": 511269597.8625401,
+            match = re.search(r'"(\w+)":\s*([-+]?[\d.e+-]+)', comment)
+            if match:
+                key = match.group(1)
+                value_str = match.group(2)
+                try:
+                    value = float(value_str)
                     params[key] = value
-            
-            return params
+                except ValueError:
+                    pass
+        
+        if not params:
+            raise ValueError("No parameters could be extracted from FITS header!")
+        
+        return params
+    
 
     def set_scaling_params(self, means, stds):
         self.scaler_means, self.scaler_stds = means, stds
@@ -482,19 +678,7 @@ class FitsDataset(data.Dataset):
         if self.mask_13co and getattr(self, "_chan_mask", None) is not None:
             data[self._chan_mask, :, :] = 0.0  # zero out masked channels; avoid NaNs
 
-        # ---------------- CPU-SIDE NOISE — REMOVED ----------------
-        # rng = np.random
-        # noise_rms = 0.0
-        # if self.use_cauchy_noise:
-        #     rms = self.cauchy_mu + self.cauchy_sigma * np.abs(rng.standard_cauchy(size=1))
-        #     while rms > self.cauchy_threshold:
-        #         rms = self.cauchy_mu + self.cauchy_sigma * np.abs(rng.standard_cauchy(size=1))
-        #     noise_rms = float(rms)
-        #     data = data + rng.normal(0.0, noise_rms, size=data.shape).astype(np.float32)
-        # elif self.add_noise_level > 0.0:
-        #     noise_rms = float(self.add_noise_level)
-        #     data = data + rng.normal(0.0, noise_rms, size=data.shape).astype(np.float32)
-        # ----------------------------------------------------------
+        
 
         # NaN repair (keep: rare but helpful; vectorized and cheap)
         repair_nans = True
@@ -513,7 +697,7 @@ class FitsDataset(data.Dataset):
             label_t = (label_t - self.scaler_means) / self.scaler_stds
 
         x = torch.from_numpy(data.astype(np.float32, copy=False)).unsqueeze(0)
-        # [CHANGED RETURN]: (x, label_t) only; noise_rms removed
+       
         return x, label_t
 
 # ------------------ Scaling ------------------ #
@@ -579,12 +763,14 @@ def create_dataloaders(
     num_workers=32,
     train_sampler=None,
     test_sampler=None,
-    model_params=("D","L","ro","rr","p","Tlow","NCH3CN","plummer_shape"),
-    log_scale_params=("D","L","NCH3CN"),
+    model_params=("M","D","L","ro","p","Tlow","NCH3CN"),
+    log_scale_params=("M","D","L","NCH3CN"),
     data_subset_fraction=1.0,
     seed: int = 42,
     prep_mode: Literal["prepare","load"] = "load",
     mask_13co: bool = True,
+    labels_cache_dir=None,  # NEW: Cache directory for labels
+    num_workers_extract=32,  # NEW: Parallel workers for extraction
 ):
     """
     Creates and configures the training and validation dataloaders.
@@ -599,6 +785,11 @@ def create_dataloaders(
     """
     print(f"[DATALOADER] Starting in '{prep_mode}' mode.")
     assert scaling_params_path is not None, "A `scaling_params_path` must be provided to store/load dataset info."
+    # Determine cache directory
+    if labels_cache_dir is None and scaling_params_path is not None:
+        # Put cache next to scaling params
+        labels_cache_dir = os.path.join(os.path.dirname(scaling_params_path), ".labels_cache")
+    
 
     # --- Generate unique, fraction-aware paths for index files ---
     # This is the core fix: filenames will now include the fraction (e.g., "split_frac0p2.pt").
@@ -642,6 +833,8 @@ def create_dataloaders(
             # use_cauchy_noise=use_cauchy_noise,
             # cauchy_mu=cauchy_mu, cauchy_sigma=cauchy_sigma, cauchy_threshold=cauchy_threshold,
             # add_noise_level=add_noise_level, snr_threshold=snr_threshold,
+            labels_cache_dir=labels_cache_dir,  # NEW
+            num_workers_extract=num_workers_extract,  # NEW
         )
         num_total = len(ds_full)
         
