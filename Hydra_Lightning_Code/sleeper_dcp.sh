@@ -3,7 +3,7 @@
 #SBATCH --output=slurm_output/sleeper/sleeper_dcp_%j.out
 #SBATCH --error=slurm_output/sleeper/sleeper_dcp_%j.err
 #SBATCH --partition=dc-hwai
-#SBATCH --account=westai0043
+#SBATCH --account=westai0101
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=8  # Allocate enough CPUs for the eventual Python run
 #SBATCH --mem=128G         # Allocate enough memory
@@ -25,7 +25,7 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 
 # --- Define Paths ---
-SRC="/p/scratch/pasta/production_run/Data_14.10.25_mass_models/"
+SRC="/p/project1/westai0101/Jusuf_Model_Data/Data_14.10.25_mass_models/"
 LIST="$(realpath arcsec_files.txt)"
 #ORIGINAL_FITS_SCRATCH_DIR="/p/scratch/pasta/CNN/17.03.25/Data_100/"
 NODE_LOCAL_DIR="/local/nvme/${SLURM_JOB_ID}_fits_data"

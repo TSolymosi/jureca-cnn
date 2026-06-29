@@ -9,8 +9,8 @@ early_stopping:
 prediction_scatter:
   _target_: src.callbacks.prediction_plot_callback.PredictionPlotCallback
   output_dir: ${outputs_dir}
-  enable_parameter_space_diagnostics: true      # Enable diagnostics
-  diagnostic_target_params: ['p', 'Tlow']       # Only these params
+  enable_parameter_space_diagnostics: false      # Enable diagnostics
+  diagnostic_target_params: []       # Only these params
   diagnostic_plot_every_n_epochs: 10             # Every 10 epochs
 
 

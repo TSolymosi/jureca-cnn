@@ -23,7 +23,10 @@ logger:
 training_strategy:
   two_stage_training:
     enabled: True
-    switch_epoch: 80
+    # Epoch when the cov_head ONLY starts training (Stage 2)
+    switch_epoch_stage2: 50 
+    # Epoch when the FULL model starts fine-tuning (Stage 3)
+    switch_epoch_stage3: 80
 
 hydra:
   run:

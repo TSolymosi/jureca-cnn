@@ -237,6 +237,9 @@ class LitResNetMDN(LightningModule):
         add_gauss_sigma: float = 0.0,
         mask_frac: float = 0.0,
         mask_mode: str = "sample",
+        # Add job ids for the current job and optionally a a previous job to continue
+        job_id: Optional[str] = None,
+        load_id: Optional[str] = None,
     ):
         super().__init__()
         # `save_hyperparameters` stores the arguments to __init__ in self.hparams,
@@ -296,7 +299,7 @@ class LitResNetMDN(LightningModule):
         # `sigma_head_outputs_positive`: Does the model head guarantee positive sigmas (e.g., via softplus)?
         # `sigma_floor`: A small value to clamp sigmas to, preventing numerical instability (e.g., log(0)).
         self.sigma_head_outputs_positive = getattr(model_cfg, "sigma_head_outputs_positive", True)
-        self.sigma_floor = getattr(model_cfg, "sigma_floor", 1e-4)
+        self.sigma_floor = getattr(model_cfg, "sigma_floor", 1e-6)
 
         # --- Section 3: Miscellaneous Setup ---
         self.std_weights = std_weights # Optional weights for the loss function.
@@ -324,7 +327,10 @@ class LitResNetMDN(LightningModule):
         self.aug_mask_mode = mask_mode
 
         # --- Section 5: Two-Stage Training Setup ---
-        self.is_stage_1 = True # Default to Stage 
+        self.is_stage_1 = True # Default to Stage 1
+
+        
+
     
     
 
@@ -406,28 +412,44 @@ class LitResNetMDN(LightningModule):
                 # --- STAGE 1: Train means and mixture weights only ---
                 
                 # Find the "best" component for each data point using the mixture weights
-                pi_weights = F.softmax(out["pi_logits"], dim=-1) # [B, K]
-                # Use Gumbel-Softmax as a differentiable replacement for argmax.
-                # `hard=True` makes the forward pass output a one-hot vector [0., 1., 0.],
-                # but the backward pass is fully differentiable.
-                # `tau` is the temperature; a value of 1.0 is a good starting point.
-                best_component_one_hot = F.gumbel_softmax(out["pi_logits"], tau=1.0, hard=True, dim=-1) # Shape: [B, K]
-                
-                # Use the one-hot vector to select the best mean for each sample.
-                # This is a differentiable way to perform the selection.
-                # out["mu"] has shape [B, K, d]. best_component_one_hot.unsqueeze(-1) has shape [B, K, 1].
-                # The multiplication zeros out the non-selected components. The sum collapses the K dimension.
-                best_mu = (out["mu"] * best_component_one_hot.unsqueeze(-1)).sum(dim=1) # Shape: [B, d]
-                
-                # Use a simple MSE loss on the means of the most likely components.
-                # This forces the means to go to the right place and the mixture weights
-                # to correctly identify the best component, without involving the covariance.
-                total_loss = F.mse_loss(best_mu, y)
+
+                pi_weights = F.softmax(out["pi_logits"], dim=-1)  # Shape: [B, K]
+
+                # Expand y to match mu's shape for broadcasting
+                y_expanded = y.unsqueeze(1) # Shape: [B, 1, d]
+
+                # Calculate the MSE for each component against the target
+                per_component_mse = F.mse_loss(out["mu"], y_expanded, reduction='none').mean(dim=-1) # Shape: [B, K]
+
+                # Weight the MSE of each component by its mixture probability and sum them up
+                soft_mse_loss = (pi_weights * per_component_mse).sum(dim=-1).mean()
+
+                # Initialize as a zero tensor on the correct device to ensure it exists for logging
+                mixture_penalty = torch.tensor(0.0, device=self.device)
+                num_mixtures = out["pi_logits"].shape[1]
+                if num_mixtures > 1 and not self.fixed_mixture_weights:
+                    # Get the softmax (probabilities) and log_softmax of the mixture logits
+                    pi_weights = torch.softmax(out["pi_logits"], dim=-1)  # Shape: [B, K]
+                    log_pi = F.log_softmax(out["pi_logits"], dim=-1)
+
+                    # Calculate the negative entropy. The optimizer will try to make this
+                    # value less negative (i.e., maximize entropy), encouraging balanced weights.
+                    negative_entropy = (pi_weights * log_pi).sum(dim=-1).mean()
+
+                    # Define the strength of the penalty. This is a new hyperparameter you can tune.
+                    # Start with a small value like 0.01.
+                    mixture_penalty_weight = 0.1
+
+                    # Calculate the final penalty term to be added to the loss
+                    mixture_penalty = mixture_penalty_weight * negative_entropy
+
+                total_loss = soft_mse_loss + mixture_penalty
                 
                 # --- STAGE 1 DIAGNOSTIC LOGGING ---
                 if batch_idx == 0 and self.trainer.is_global_zero:
                     print(f"\n==================== [STAGE 1 - Epoch {self.current_epoch}] ====================")
                     print(f"    Proxy Loss (MSE on best mean): {total_loss.item():.4f}")
+                    print(f"    Mixture Entropy Penalty:        {mixture_penalty.item():.4f}")
                     
                     # Print mixture weight distribution
                     print("\n[Mixture Weight Distribution (Mean across batch)]")
@@ -437,8 +459,8 @@ class LitResNetMDN(LightningModule):
                     print(f"=======================================================================\n", flush=True)
 
             else:
-                # --- STAGE 2: Train the full MDN with NLL and all penalties ---
-                # This is your complete, existing loss logic.
+                # --- STAGE 2 & 3: Train with the full MDN NLL loss ---
+                # The optimizer configuration determines WHAT is being trained (cov_head only or everything).
                 
                 # 5. Calculate loss based on the model's output structure.
 
@@ -458,32 +480,38 @@ class LitResNetMDN(LightningModule):
                         # --- SECTION 1: GENTLE PULL TOWARDS A HEALTHY MEAN ---
                         # Re-enable this with a small weight. It provides a constant, gentle pressure
                         # to keep all sigmas in a reasonable range and prevents them from drifting too high.
-                        target_sigma = 0.1
-                        soft_reg_weight = 0.01  # A small value like 0.01 is a good start
+                        target_sigma = 0.01
+                        soft_reg_weight = 0.0001  # A small value like 0.001 is a good start
                         sigma_reg_loss = soft_reg_weight * ((sigma_components - target_sigma) ** 2).mean()
+
+                        
 
                         # --- SECTION 2: STRONG, TARGETED ANTI-COLLAPSE PENALTY ---
                         # This is your most important tool. We will set higher floors for the problem parameters.
-                        min_sigma_thresholds = torch.ones(len(self.model_params), device=self.device) * 0.005 # Base floor
+                        min_sigma_thresholds = torch.ones(len(self.model_params), device=self.device) * 0.001 # Base floor
                         name2idx = {n: i for i, n in enumerate(self.model_params)}
 
-                        # UNCOMMENT AND SET SPECIFIC, HIGHER THRESHOLDS FOR PROBLEM PARAMETERS:
-                        if 'ro' in name2idx:
-                            min_sigma_thresholds[name2idx['ro']] = 0.01  # Force 'ro' to stay above 0.2
-                        if 'NCH3CN' in name2idx:
-                            min_sigma_thresholds[name2idx['NCH3CN']] = 0.01 # Force 'NCH3CN' to stay above 0.2
-                        if 'L' in name2idx:
-                            min_sigma_thresholds[name2idx['L']] = 0.01 # A slightly higher floor for 'L'
+                        # SET SPECIFIC, HIGHER THRESHOLDS FOR PROBLEM PARAMETERS:
+                        # if 'ro' in name2idx:
+                        #     min_sigma_thresholds[name2idx['ro']] = 0.01  
+                        # if 'NCH3CN' in name2idx:
+                        #     min_sigma_thresholds[name2idx['NCH3CN']] = 0.01 
+                        # if 'L' in name2idx:
+                        #     min_sigma_thresholds[name2idx['L']] = 0.01 
 
-                        # The penalty calculation itself is good. A weight of 30.0 is strong, which is what you need.
                         min_sigma_thresholds = min_sigma_thresholds.view(1, 1, -1)
                         violation = torch.clamp(min_sigma_thresholds - sigma_components, min=0.0)
-                        min_sigma_penalty = 20.0 * (violation ** 2).mean()
+
+                        # CRITICAL FIX: Use L1 penalty instead of L2. 
+                        # L2 gradients vanish near the threshold. L1 provides a constant, strong push.
+                        min_sigma_penalty = 100.0 * violation.mean()
+
+                    
 
                         # --- SECTION 3: (OPTIONAL) PENALTY FOR EXCESSIVE UNCERTAINTY ---
                         # Keeping this is fine. It prevents the model from becoming too uncertain, but it's not
                         # the solution to your current problem of *too little* uncertainty.
-                        max_sigma_threshold = 3.0
+                        max_sigma_threshold = 2.0
                         violation_max = torch.clamp(sigma_components - max_sigma_threshold, min=0.0)
                         max_sigma_penalty = 0.1 * (violation_max ** 2).mean()
 
@@ -503,9 +531,22 @@ class LitResNetMDN(LightningModule):
                             # value less negative (i.e., maximize entropy), encouraging balanced weights.
                             negative_entropy = (pi_weights * log_pi).sum(dim=-1).mean()
 
-                            # Define the strength of the penalty. This is a new hyperparameter you can tune.
-                            # Start with a small value like 0.01.
-                            mixture_penalty_weight = 0.01
+                            # Base weight for epoch 1 and 2. We will decay this in Stage 3 to allow the model to express high confidence if needed.
+                            mixture_penalty_weight = 1.0
+                            
+                            # Decay the penalty late in training (Stage 3)
+                            s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+                            if self.current_epoch >= s3_epoch + 40:
+                                # 40 epochs into Stage 3, the penalty is no longer needed and can be turned off to allow confident predictions if the data supports it.
+                                mixture_penalty_weight = 0.0
+                            elif self.current_epoch >= s3_epoch + 20:
+                                # Gradually reduce it further in the middle of Stage 3
+                                mixture_penalty_weight = 0.01 
+                            elif self.current_epoch >= s3_epoch:
+                                # Gradually reduce it at the start of Stage 3
+                                mixture_penalty_weight = 0.1 
+
+                            
 
                             # Calculate the final penalty term to be added to the loss
                             mixture_penalty = mixture_penalty_weight * negative_entropy
@@ -518,8 +559,10 @@ class LitResNetMDN(LightningModule):
                         # --- UPDATED DIAGNOSTIC LOGGING BLOCK ---
                         # This block should replace your existing print statements for batch 0
                         if batch_idx == 0 and self.trainer.is_global_zero:
-                            print(f"\n==================== [STAGE 2 - Epoch {self.current_epoch}] ====================")
-
+                            s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+                            stage_label = "STAGE 3 (Fine-tuning)" if self.current_epoch >= s3_epoch else "STAGE 2 (Cov-Head Warmup)"
+                            print(f"\n==================== [{stage_label} - Epoch {self.current_epoch}] ====================")
+                            
                             # 1. Print sigma statistics (as before)
                             print("[Sigma Statistics (Component-wise)]")
                             for i, name in enumerate(self.model_params):
@@ -1213,51 +1256,55 @@ class LitResNetMDN(LightningModule):
     
     def _mog_nll_full(self, pi_logits: torch.Tensor, mu: torch.Tensor, L: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
-        Calculates the NLL for a Mixture of Gaussians with full covariance (using Cholesky factor L).
-
-        Args:
-            pi_logits (torch.Tensor): Logits for mixture weights, shape [B, K].
-            mu (torch.Tensor): Means of the K components, shape [B, K, d].
-            L (torch.Tensor): Cholesky factors of the K components, shape [B, K, d, d].
-            y (torch.Tensor): Target vector, shape [B, d].
-
-        Returns:
-            torch.Tensor: The mean NLL loss over the batch.
+        Calculates NLL for Mixture of Gaussians with Full Covariance.
+        
+        UPDATED: Assumes 'L' is already a valid Cholesky factor (positive diagonal),
+        so we do NOT add jitter or re-apply softplus here.
         """
         B, K, d = mu.shape
-        log_pi = F.log_softmax(pi_logits, dim=-1)   # Shape: [B, K]
+        
+        # 1. Log-Probabilities of mixing coefficients
+        log_pi = F.log_softmax(pi_logits, dim=-1)   # [B, K]
 
-        # Calculate log probability within a float32 context for stability.
+        # 2. Gaussian Log-Likelihood per component
+        # Use float32 for linear algebra stability
         with torch.amp.autocast('cuda', enabled=False):
-            # Convert to float32 for numerical stability
             L_f32 = L.float()
             mu_f32 = mu.float()
             y_f32 = y.float()
             
-            # Compute Mahalanobis distance: (y - μ)ᵀ Σ⁻¹ (y - μ)
-            # Since Σ = L @ Lᵀ, we have Σ⁻¹ = (Lᵀ)⁻¹ @ L⁻¹
-            # So (y - μ)ᵀ Σ⁻¹ (y - μ) = ||L⁻¹(y - μ)||²
-            y_mu = (y_f32.unsqueeze(1) - mu_f32).unsqueeze(-1)  # Shape: [B, K, d, 1]
-            z = torch.linalg.solve_triangular(L_f32, y_mu, upper=False)  # Shape: [B, K, d, 1]
-            maha = z.square().sum(dim=(-2, -1))  # Shape: [B, K]
+            # --- Mahalanobis Distance: (y - μ)ᵀ Σ⁻¹ (y - μ) ---
+            # We solve Lz = (y - μ), then distance is ||z||²
             
-            # Compute log determinant: log|Σ| = log|L @ Lᵀ| = 2 * log|L| = 2 * sum(log(diag(L)))
-            diag = torch.diagonal(L_f32, dim1=-2, dim2=-1)  # Shape: [B, K, d]
+            # Expand y to match K components: [B, K, d, 1]
+            y_mu = (y_f32.unsqueeze(1) - mu_f32).unsqueeze(-1)
             
-            # Add small epsilon to prevent log(0), though CovarianceHead should prevent this
-            logdet = 2.0 * torch.log(diag.clamp(min=1e-6)).sum(-1)  # Shape: [B, K]
+            # Solve triangular system. 
+            # Note: L is guaranteed lower triangular by the Head.
+            z = torch.linalg.solve_triangular(L_f32, y_mu, upper=False)
             
-            # Constant term
+            # Sum of squares: [B, K]
+            maha = z.square().sum(dim=(-2, -1))
+            
+            # --- Log Determinant: log|Σ| = 2 * log|L| ---
+            # Extract diagonal: [B, K, d]
+            diag = torch.diagonal(L_f32, dim1=-2, dim2=-1)
+            
+            # CHANGE: Removed "+ 1e-6" jitter. 
+            # The Head already clamps to self.min_sigma. Adding more here breaks 
+            # the gradient flow for very small sigmas.
+            logdet = 2.0 * torch.log(diag).sum(-1)
+            
+            # --- Constant Term ---
             const = d * math.log(2.0 * math.pi)
             
-            # Log probability for each component: log p(y | component k)
-            log_prob = -0.5 * (maha + logdet + const)  # Shape: [B, K]
+            # Log-prob per component
+            log_prob = -0.5 * (maha + logdet + const)
 
-        # Mixture log probability: log p(y) = log(sum_k π_k * p(y | k))
-        # Computed stably as: logsumexp(log(π_k) + log(p(y | k)))
-        total_log_prob = (log_pi + log_prob).logsumexp(dim=-1)  # Shape: [B]
+        # 3. Log-Sum-Exp for the Mixture
+        # log( sum( pi_k * N_k ) )  ->  logsumexp( log_pi + log_N )
+        total_log_prob = (log_pi + log_prob).logsumexp(dim=-1)
         
-        # Return mean negative log likelihood
         return -total_log_prob.mean()
 
     @staticmethod
@@ -1265,24 +1312,23 @@ class LitResNetMDN(LightningModule):
         """
         Calculates the mean and standard deviation of the entire mixture distribution.
         
-        FIXED: Proper floor on sigma, not variance.
+        FIXED: Uses numerically stable formula to prevent catastrophic cancellation.
         """
         pi = F.softmax(pi_logits, dim=-1) # [B, K]
         
-        # E[x] = sum_k( pi_k * mu_k )
+        # Mean: E[X] = sum_k pi_k * mu_k
         mu_mix = (pi.unsqueeze(-1) * mu).sum(dim=1)  # [B, d]
         
-        # Var[x] = E[x^2] - (E[x])^2
-        var_k = (sigma * sigma)  # [B, K, d]
-        second_moment = (pi.unsqueeze(-1) * (var_k + mu * mu)).sum(dim=1)  # [B, d]
-        var_mix = second_moment - mu_mix * mu_mix
+        # Variance: Var[X] = sum_k pi_k * Var_k + sum_k pi_k * (mu_k - mu_mix)^2
+        # This formula guarantees positivity and avoids floating point cancellation.
+        var_k = sigma * sigma  # [B, K, d]
+        var_within = (pi.unsqueeze(-1) * var_k).sum(dim=1)  # [B, d]
         
-        # CRITICAL FIX: Floor on sigma, not variance
-        var_mix = var_mix.clamp_min(0.0)
-        sigma_mix = var_mix.sqrt()
+        diff = mu - mu_mix.unsqueeze(1)  # [B, K, d]
+        var_between = (pi.unsqueeze(-1) * (diff * diff)).sum(dim=1)  # [B, d]
         
-        MIN_SIGMA = 0.001
-        sigma_mix = torch.clamp(sigma_mix, min=MIN_SIGMA)
+        var_mix = var_within + var_between
+        sigma_mix = torch.clamp(var_mix.sqrt(), min=1e-6)
         
         return mu_mix, sigma_mix
 
@@ -1291,29 +1337,24 @@ class LitResNetMDN(LightningModule):
         """
         Calculates the marginal mean and standard deviation for a full-covariance mixture.
         
-        FIXED: Proper floor on sigma, not variance.
+        FIXED: Uses numerically stable formula to prevent catastrophic cancellation.
         """
-        
         pi = F.softmax(pi_logits, dim=-1)
         # Mean: E[X] = sum_k pi_k * mu_k
         mu_mix = (pi.unsqueeze(-1) * mu).sum(dim=1)  # [B, d]
         
         # Diagonal of covariance matrix for each component
-        #diag_Sigma_k = (L * L).sum(dim=-1)  # [B, K, d]
-        diag_Sigma_k = torch.einsum('...ij,...ij->...i', L, L) 
+        diag_Sigma_k = torch.einsum('...ij,...ij->...i', L, L)  # [B, K, d]
         
-        # Variance: Var[X] = E[Var[X|k]] + Var[E[X|k]]
-        #                  = sum_k pi_k * (Sigma_k + mu_k^2) - mu_mix^2
-        second_moment = (pi.unsqueeze(-1) * (diag_Sigma_k + mu * mu)).sum(dim=1)
-        var_mix = second_moment - mu_mix * mu_mix
+        # Variance: Var[X] = sum_k pi_k * Var_k + sum_k pi_k * (mu_k - mu_mix)^2
+        # This formula guarantees positivity and avoids floating point cancellation.
+        var_within = (pi.unsqueeze(-1) * diag_Sigma_k).sum(dim=1)  # [B, d]
         
-        # CRITICAL FIX: Clamp variance carefully, then enforce minimum on sigma
-        var_mix = var_mix.clamp_min(0.0)  # Can't be negative (numerical safety)
-        sigma_mix = var_mix.sqrt()
+        diff = mu - mu_mix.unsqueeze(1)  # [B, K, d]
+        var_between = (pi.unsqueeze(-1) * (diff * diff)).sum(dim=1)  # [B, d]
         
-        # Floor the sigma itself, not the variance!
-        MIN_SIGMA = 0.001  # Minimum marginal sigma in scaled space
-        sigma_mix = torch.clamp(sigma_mix, min=MIN_SIGMA)
+        var_mix = var_within + var_between
+        sigma_mix = torch.clamp(var_mix.sqrt(), min=1e-6)
         
         return mu_mix, sigma_mix
 
@@ -1555,32 +1596,30 @@ class LitResNetMDN(LightningModule):
 
     def configure_optimizers(self):
         """
-        Sets up the optimizer and an optional learning rate scheduler.
+        Sets up the optimizer with ALL parameters initially.
         """
-        # AdamW is a common and effective choice for deep learning models.
+        # Important: Do not filter by requires_grad=True here. 
+        # Pass ALL model parameters so the optimizer tracks them even while frozen.
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            self.model.parameters(), # Pass full model.parameters()
             lr=self.hparams.optim_cfg.lr,
             weight_decay=self.hparams.optim_cfg.weight_decay,
         )
         
-        # ReduceLROnPlateau automatically reduces the learning rate when a metric
-        # (in this case, validation loss) has stopped improving.
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',      # Reduce LR when the metric stops decreasing
-            factor=0.2,      # new_lr = lr * factor
-            patience=5,      # Number of epochs with no improvement to wait before reducing LR
-            min_lr=1e-6      # Lower bound on the learning rate
+            mode='min',
+            factor=0.2,
+            patience=5,
+            min_lr=1e-6
         )
         
-        # This dictionary structure is required by PyTorch Lightning.
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val/loss", # The metric to monitor for the scheduler
-                "frequency": 1         # Check the metric every validation epoch
+                "monitor": "val/loss",
+                "frequency": 1
             }
         }
     
@@ -1614,87 +1653,302 @@ class LitResNetMDN(LightningModule):
                 print(f"{GREEN}All parameters that require gradients received them. No culprits found.{RESET}")
             print(f"--- [END DEBUGGER] ---\n", flush=True)
 
-    # In lightning_resnet.py, inside the LitResNetMDN class
+    
 
-    # --- 1. Add this new setup method ---
+    # --- START: NEW 3-STAGE TRAINING HOOKS ---
+
+    def _set_trainable_layers(self, backbone_is_trainable: bool, cov_head_is_trainable: bool, pi_head_is_trainable: bool=True):
+        """A helper function to set the requires_grad status for model parts."""
+        # Freeze/unfreeze the main model backbone (everything except cov_head)
+        for name, param in self.model.named_parameters():
+            if 'cov_head' not in name:
+                param.requires_grad = backbone_is_trainable
+            if 'pi_head' in name:
+                param.requires_grad = pi_head_is_trainable
+        
+        # Freeze/unfreeze the covariance head
+        for param in self.model.cov_head.parameters():
+            param.requires_grad = cov_head_is_trainable
+
     def setup(self, stage: str):
         """
-        Called at the beginning of fit, validate, or test. This is the ideal
-        place to perform model modifications before DDP wrapping.
+        Called at the beginning of fit. Always sets the initial state to Stage 1.
         """
         if stage == 'fit':
-            # Check if two-stage training is enabled in the config
-            is_two_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
-            
-            if is_two_stage:
+            is_three_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
+            if is_three_stage:
                 self.print(f"\n{'='*80}")
-                self.print(f"SETUP hook: Two-stage training is enabled. Freezing cov_head by default for Stage 1.")
+                self.print(f"SETUP: 3-Stage training enabled. Starting in Stage 1 (backbone trainable, cov_head frozen).")
                 self.print(f"{'='*80}\n", flush=True)
-                
-                # Freeze the covariance head here. This happens on every process
-                # BEFORE DDP is configured, so it won't see these params as trainable.
-                for param in self.model.cov_head.parameters():
-                    param.requires_grad = False
-                
+                self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=False)
                 self.is_stage_1 = True
             else:
-                self.is_stage_1 = False
+                self.is_stage_1 = False # Standard single-stage training
 
-    # --- 2. Add this new on_train_start hook for handling resumes ---
+    # In lightning_resnet.py, replace your on_train_start with this simpler version
+
     def on_train_start(self):
         """
-        Called after the checkpoint is loaded. Use this to handle resuming in Stage 2.
+        Ensures the correct layers are frozen/unfrozen based on the epoch 
+        when resuming from a checkpoint.
         """
-        # Read from the new hparams location
-        is_two_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
-        if not is_two_stage:
+        if not self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False):
             return
 
-        switch_epoch = self.hparams.training_cfg.get("two_stage_training", {}).get("switch_epoch", 9999)
+        s2_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage2
+        s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+        optimizer = self.trainer.optimizers[0]
+        
+        self.print(f"ON_TRAIN_START: Configuring layers for epoch {self.current_epoch}.")
 
-        # If we are resuming from a checkpoint that is already in Stage 2...
-        if self.current_epoch >= switch_epoch:
-            self.print(f"\n{'='*80}")
-            self.print(f"ON_TRAIN_START: Resuming in STAGE 2 (epoch {self.current_epoch}). Unfreezing cov_head.")
-            self.print(f"{'='*80}\n", flush=True)
-            
-            # Unfreeze the head and update the state
-            for param in self.model.cov_head.parameters():
-                param.requires_grad = True
+        # Just set the frozen status; do NOT touch the optimizer here.
+        if self.current_epoch >= s3_epoch:
+            self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=True, pi_head_is_trainable=True)
+            # Update LR for fine-tuning IN PLACE
+            fine_tune_lr = self.hparams.optim_cfg.lr / 100.0
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = fine_tune_lr
+                
+            self.print(f"Optimizer LR updated to {fine_tune_lr} (State preserved)")
             self.is_stage_1 = False
+        elif self.current_epoch >= s2_epoch:
+            self._set_trainable_layers(backbone_is_trainable=False, cov_head_is_trainable=True)
+            self.is_stage_1 = False
+        else:
+            self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=False)
+            self.is_stage_1 = True
 
-    # --- 3. Add this new on_train_epoch_start hook for the live transition ---
+    
+
+    # def on_train_start(self):
+    #     """
+    #     Called after checkpoint loading. Its main job now is to ensure the
+    #     optimizer is correctly configured for the CURRENT state of the model.
+    #     """
+    #     is_three_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
+    #     if not is_three_stage:
+    #         return
+
+    #     s2_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage2
+    #     s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+        
+    #     self.print(f"ON_TRAIN_START: Configuring optimizer for epoch {self.current_epoch}.")
+
+    #     if self.current_epoch >= s3_epoch:
+    #         # Configure optimizer for Stage 3 (fine-tuning all params)
+    #         new_lr = self.hparams.optim_cfg.lr / 100.0
+    #         self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=True, pi_head_is_trainable=True)
+    #         # self.parameters() will now return all trainable params, which is the entire model in Stage 3.
+    #         optimizer = torch.optim.AdamW(self.parameters(), lr=new_lr, weight_decay=self.hparams.optim_cfg.weight_decay)
+    #         self.trainer.optimizers = [optimizer]
+
+    #     elif self.current_epoch >= s2_epoch:
+    #         # Configure optimizer for Stage 2 (cov_head only)
+    #         optimizer = torch.optim.AdamW(self.model.cov_head.parameters(), lr=self.hparams.optim_cfg.lr, weight_decay=self.hparams.optim_cfg.weight_decay)
+    #         self.trainer.optimizers = [optimizer]
+            
+    #     else:
+    #         # Configure optimizer for Stage 1 (backbone only)
+    #         # self.parameters() will correctly return only the trainable params.
+    #         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.optim_cfg.lr, weight_decay=self.hparams.optim_cfg.weight_decay)
+    #         self.trainer.optimizers = [optimizer]
+
+    # def on_train_epoch_start(self):
+    #     """
+    #     Handles the live transitions between stages during a continuous run.
+    #     """
+    #     is_three_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
+    #     if not is_three_stage: return
+
+    #     s2_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage2
+    #     s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+
+    #     # --- Transition to Stage 2 ---
+    #     if self.is_stage_1 and self.current_epoch == s2_epoch:
+    #         self.print(f"\n{'='*80}")
+    #         self.print(f"TRANSITIONING to STAGE 2 at epoch {self.current_epoch}: Training cov_head ONLY.")
+    #         self.print(f"{'='*80}\n", flush=True)
+    #         self._set_trainable_layers(backbone_is_trainable=False, cov_head_is_trainable=True)
+    #         self.is_stage_1 = False # We are no longer in Stage 1
+    #         # Reconfigure optimizer for only cov_head
+    #         optimizer = torch.optim.AdamW(self.model.cov_head.parameters(), lr=self.hparams.optim_cfg.lr, weight_decay=self.hparams.optim_cfg.weight_decay)
+    #         self.trainer.optimizers = [optimizer]
+
+    #     # --- Transition to Stage 3 ---
+    #     # The condition `not self.is_stage_1` ensures this only runs after Stage 2 has started.
+    #     elif not self.is_stage_1 and self.current_epoch == s3_epoch:
+    #         self.print(f"\n{'='*80}")
+    #         self.print(f"TRANSITIONING to STAGE 3 at epoch {self.current_epoch}: Fine-tuning ALL parameters.")
+    #         self.print(f"{'='*80}\n", flush=True)
+            
+    #         # Reconfigure optimizer for all parameters with a tiny learning rate
+    #         self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=True, pi_head_is_trainable=True)
+
+    #         # --- Set up differential learning rates ---
+    #         fine_tune_lr = self.hparams.optim_cfg.lr / 100.0 # Tiny LR for the backbone
+    #         head_lr = self.hparams.optim_cfg.lr / 20.0      # A slightly larger LR for the heads
+    #         pi_lr = self.hparams.optim_cfg.lr / 50.0        # Pi head is not frozen, so set a moderate LR for it
+    #         # Create parameter groups
+    #         backbone_params = [
+    #             p for n, p in self.model.named_parameters() 
+    #             if 'cov_head' not in n and 'pi_head' not in n and 'output_heads' not in n
+    #         ]
+    #         head_params = [
+    #             p for n, p in self.model.named_parameters() 
+    #             if 'cov_head' in n or 'output_heads' in n # Exclude pi_head from the head_params to keep it frozen in Stage 3
+    #         ]
+    #         pi_head_params = [
+    #             p for n, p in self.model.named_parameters() 
+    #             if 'pi_head' in n
+    #         ]
+
+    #         param_groups = [
+    #             {"params": backbone_params, "lr": fine_tune_lr},
+    #             {"params": head_params, "lr": head_lr},
+    #             {"params": pi_head_params, "lr": pi_lr}
+    #         ]
+
+    #         optimizer = torch.optim.AdamW(
+    #             param_groups, # Pass the groups instead of self.parameters()
+    #             # The main 'lr' is now just a default, the group LRs will be used
+    #             lr=fine_tune_lr, 
+    #             weight_decay=self.hparams.optim_cfg.weight_decay,
+    #         )
+    #         trainable_params = [p for p in self.parameters() if p.requires_grad]
+
+    #         # Debug print to verify which parameters are trainable at the start of Stage 3
+    #         # for n, p in self.named_parameters():
+    #         #     if p.requires_grad:
+    #         #         print("TRAINABLE:", n)
+
+    #         # optimizer = torch.optim.AdamW(
+    #         #     trainable_params, # Only include parameters that are currently trainable
+    #         #     lr=fine_tune_lr, 
+    #         #     weight_decay=self.hparams.optim_cfg.weight_decay,
+    #         # )
+    #         self.trainer.optimizers = [optimizer]
+
     def on_train_epoch_start(self):
         """
-        Called at the start of each epoch. Use this to transition from Stage 1 to 2.
+        Handles transitions between stages by modifying parameter groups 
+        IN PLACE, without resetting optimizer state.
         """
-        # Read from the new hparams location
-        is_two_stage = self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False)
-        if not is_two_stage or not self.is_stage_1: # Only run if enabled and still in Stage 1
+        if not self.hparams.strategy_cfg.get("two_stage_training", {}).get("enabled", False):
             return
 
-        switch_epoch = self.hparams.training_cfg.get("two_stage_training", {}).get("switch_epoch", 9999)
+        s2_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage2
+        s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+        optimizer = self.trainer.optimizers[0]
 
-        # If this is the epoch to make the switch...
-        if self.current_epoch == switch_epoch:
+        # --- Transition to Stage 2 ---
+        if self.is_stage_1 and self.current_epoch == s2_epoch:
             self.print(f"\n{'='*80}")
-            self.print(f"ON_TRAIN_EPOCH_START: Transitioning to STAGE 2 at epoch {self.current_epoch}.")
-            self.print("Unfreezing covariance head and reconfiguring optimizer.")
+            self.print(f"TRANSITIONING to STAGE 2 at epoch {self.current_epoch}: Training cov_head ONLY.")
             self.print(f"{'='*80}\n", flush=True)
-
-            # 1. Unfreeze
-            for param in self.model.cov_head.parameters():
-                param.requires_grad = True
             
-            # 2. Update state
-            self.is_stage_1 = False
+            self._set_trainable_layers(backbone_is_trainable=False, cov_head_is_trainable=True)
+            self.is_stage_1 = False 
 
-            # 3. Reconfigure optimizer(s) to include the new parameters
-            # Lightning is smart enough to handle this automatically when you re-assign them.
-            new_lr = self.hparams.optim_cfg.lr / 5.0
-            optimizer = torch.optim.AdamW(
-                self.parameters(), # self.parameters() now correctly includes the un-frozen head
-                lr=new_lr,
-                weight_decay=self.hparams.optim_cfg.weight_decay,
-            )
-            self.trainer.optimizers = [optimizer]
+            # Optional: Reset LR to base value if needed, but keeping momentum is key
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = self.hparams.optim_cfg.lr
+
+        # --- Transition to Stage 3 ---
+        # Check explicitly if we are entering Stage 3 or strictly inside it
+        elif self.current_epoch == s3_epoch:
+            # Check if we have already transitioned to avoid spamming/resetting LR every epoch
+            # (Using a flag or just checking if backbone is frozen would work, 
+            # but simpler to just run this logic once at the specific epoch)
+            
+            self.print(f"\n{'='*80}")
+            self.print(f"TRANSITIONING to STAGE 3 at epoch {self.current_epoch}: Fine-tuning ALL parameters.")
+            self.print(f"{'='*80}\n", flush=True)
+            
+            # Unfreeze
+            self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=True, pi_head_is_trainable=False)
+            
+            # Update LR for fine-tuning IN PLACE
+            fine_tune_lr = self.hparams.optim_cfg.lr / 100.0
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = fine_tune_lr
+                
+            self.print(f"Optimizer LR updated to {fine_tune_lr} (State preserved)")
+
+   
+   
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Robust Checkpoint Surgery (Fixed for Smooth Continuation).
+        """
+        state_dict = checkpoint["state_dict"]
+        current_model_dict = self.model.state_dict()
+        
+        lightning_prefix = "model."       
+        module_identifier = "cov_head"    
+        
+        # 1. Identify keys belonging to cov_head in checkpoint and current model
+        ckpt_cov_keys = [k for k in state_dict.keys() if f"{lightning_prefix}{module_identifier}" in k]
+        curr_cov_keys = [k for k in current_model_dict.keys() if k.startswith(module_identifier)]
+        
+        # Determine if surgery is needed by checking if shapes mismatch
+        needs_surgery = False
+        
+        if len(ckpt_cov_keys) != len(curr_cov_keys):
+            needs_surgery = True
+        else:
+            for local_key in curr_cov_keys:
+                global_key = f"{lightning_prefix}{local_key}"
+                # If key is missing or shapes don't match, we need surgery
+                if global_key not in state_dict or state_dict[global_key].shape != current_model_dict[local_key].shape:
+                    needs_surgery = True
+                    break
+
+        print(f"\n{'='*80}")
+        print(f"[CHECKPOINT LOAD] Inspecting for architecture compatibility...")
+
+        if needs_surgery:
+            print(f" -> DETECTED ARCHITECTURE MISMATCH in '{module_identifier}'. Performing surgery.")
+            
+            # Step 1: Remove ALL old covariance keys from the checkpoint
+            if ckpt_cov_keys:
+                for k in ckpt_cov_keys:
+                    del state_dict[k]
+                print(f" -> Removed {len(ckpt_cov_keys)} incompatible parameters from checkpoint.")
+            
+            # Step 2: Inject FRESH initialized weights
+            print(f" -> Injecting fresh initialization for {len(curr_cov_keys)} parameters.")
+            for local_key in curr_cov_keys:
+                global_key = f"{lightning_prefix}{local_key}"
+                state_dict[global_key] = current_model_dict[local_key].clone().cpu()
+            
+            # Step 3: Wipe optimizer to prevent state mismatch crashes
+            checkpoint["optimizer_states"] = []
+            checkpoint["lr_schedulers"] = []
+            print(" -> Wiped optimizer state for fresh start.")
+            
+            # Step 4: Force Stage 2
+            print(" -> FORCING STAGE 2: Freezing backbone, training new cov_head.")
+            self.is_stage_1 = False
+            self._set_trainable_layers(backbone_is_trainable=False, cov_head_is_trainable=True)
+            
+        else:
+            print(f" -> Perfect match for '{module_identifier}'. Loading weights smoothly without surgery.")
+            
+            # Normal stage logic based on the resumed epoch
+            epoch = checkpoint.get("epoch", 0)
+            s2_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage2
+            s3_epoch = self.hparams.strategy_cfg.two_stage_training.switch_epoch_stage3
+            
+            if epoch >= s3_epoch:
+                self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=True)
+                self.is_stage_1 = False
+            elif epoch >= s2_epoch:
+                self._set_trainable_layers(backbone_is_trainable=False, cov_head_is_trainable=True)
+                self.is_stage_1 = False
+            else:
+                self._set_trainable_layers(backbone_is_trainable=True, cov_head_is_trainable=False)
+                self.is_stage_1 = True
+
+        print(f"{'='*80}\n", flush=True)
+

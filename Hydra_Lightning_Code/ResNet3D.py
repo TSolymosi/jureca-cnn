@@ -114,13 +114,114 @@ class MDNOutputHead(nn.Module):
     
 class CovarianceHead(nn.Module):
     """
+    Predicts Cholesky factor L by splitting diagonal and off-diagonal predictions.
+    
+    Structure:
+    - Head 1 (Diagonal): Predicts log(diagonal_elements). Controls SCALE.
+    - Head 2 (Off-Diag): Predicts off-diagonal elements. Controls CORRELATION.
+    
+    This preserves the ability to initialize them differently without the 
+    gradient-blocking normalization math of the previous version.
+    """
+    def __init__(self, input_dim: int, d: int, num_components: int = 1, 
+                 min_sigma: float = 1e-6, init_sigma_scale: float = 0.01,
+                 per_param_scales: dict = None,
+                 per_param_min_sigma: dict = None):
+        super().__init__()
+        self.d = d
+        self.K = num_components
+        self.min_sigma = min_sigma
+        init_scale = init_sigma_scale
+        
+        # 1. Diagonal Head: Predicts d elements per component
+        # We predict log(diag) to ensure positivity naturally via exp()
+        out_dim_diag = d * self.K
+        self.log_diag_head = nn.Linear(input_dim, out_dim_diag)
+        
+        # 2. Off-Diagonal Head: Predicts d*(d-1)/2 elements per component
+        self.n_lower = (d * (d - 1)) // 2
+        out_dim_lower = self.n_lower * self.K
+        self.lower_head = nn.Linear(input_dim, out_dim_lower)
+        
+        self._initialize_weights(init_scale)
+
+    def _initialize_weights(self, init_scale):
+        """
+        Initialize diagonal to specific scale (0.05) and correlations to 0.
+        """
+        import math
+        # Target: exp(bias) = init_scale  ->  bias = log(init_scale)
+        safe_scale = max(init_scale, 1e-5)
+        target_bias = math.log(safe_scale)
+        
+        with torch.no_grad():
+            # --- Diagonal Init ---
+            # Set bias to exactly log(0.05) so training starts at the right magnitude
+            self.log_diag_head.bias.fill_(target_bias)
+            # Small random noise so they aren't all identical
+            nn.init.normal_(self.log_diag_head.weight, mean=0.0, std=0.001)
+            
+            # --- Off-Diagonal Init ---
+            # Start with 0 correlation (Identity Matrix structure)
+            nn.init.constant_(self.lower_head.bias, 0.0)
+            nn.init.normal_(self.lower_head.weight, mean=0.0, std=0.001)
+
+    def forward(self, x):
+        B = x.size(0)
+        d = self.d
+        K = self.K
+        
+        # 1. Get Diagonal Elements (positive by definition of exp)
+        log_diag = self.log_diag_head(x)
+        diag_vals = torch.exp(log_diag) 
+        
+        # Apply strict floor for numerical stability
+        diag_vals = torch.clamp(diag_vals, min=self.min_sigma)
+        
+        # 2. Get Off-Diagonal Elements
+        lower_vals = self.lower_head(x)
+        
+        if K == 1:
+            L = self._build_L(diag_vals, lower_vals, B, d)
+            return {"L": L}
+        else:
+            # Reshape for mixture
+            diag_vals = diag_vals.view(B, K, d)
+            lower_vals = lower_vals.view(B, K, self.n_lower)
+            
+            L_stack = []
+            for k in range(K):
+                L_k = self._build_L(diag_vals[:, k], lower_vals[:, k], B, d)
+                L_stack.append(L_k)
+            L = torch.stack(L_stack, dim=1) # [B, K, d, d]
+            return {"L": L}
+
+    def _build_L(self, diag_vals, lower_vals, B, d):
+        """Constructs L from separated diagonal and off-diagonal vectors."""
+        # L inherits dtype from diag_vals (likely Float32 due to exp/clamp)
+        L = diag_vals.new_zeros(B, d, d)
+        
+        # Fill Diagonal
+        L.diagonal(dim1=-2, dim2=-1).copy_(diag_vals)
+        
+        # Fill Off-Diagonal
+        tril_indices = torch.tril_indices(row=d, col=d, offset=-1, device=diag_vals.device)
+        
+        # FIX: Explicitly cast lower_vals to match L's dtype (Float32)
+        # usually lower_vals is BFloat16/Float16 here due to AMP
+        L[:, tril_indices[0], tril_indices[1]] = lower_vals.to(dtype=L.dtype)
+        
+        return L
+    
+class CovarianceHead_latest(nn.Module):
+    """
     Predicts full covariance matrix via constrained Cholesky factorization.
     
     GRADIENT-SAFE: No in-place operations anywhere.
     """
     
     def __init__(self, input_dim: int, d: int, num_components: int = 1, 
-                 min_sigma: float = 0.0001, init_sigma_scale: float = 0.4,
+                 min_sigma: float = 0.0001, init_sigma_scale: float = 0.01,
                  per_param_scales: dict = None,
                  per_param_min_sigma: dict = None):
         """
@@ -153,63 +254,55 @@ class CovarianceHead(nn.Module):
     # In ResNet3D.py, inside the CovarianceHead class
 
     def _initialize_weights(self, init_sigma_scale):
-            """
-            Initialize weights for a TWO-STAGE training start.
-            The goal is to start Stage 2 from a neutral, reasonable sigma baseline.
-            """
-            # --- NEW: Define a neutral starting point for all sigmas ---
-            # A value of 0.3-0.4 is a sensible default uncertainty in the scaled space.
-            neutral_target_sigma = 0.4
+            # ... NEW: Define a neutral starting point for all sigmas ...
+            neutral_target_sigma = 0.2
 
             with torch.no_grad():
-                # The new goal is simple: set the initial bias so that the initial
-                # sigma prediction is exactly our neutral target.
-                # We no longer need different initializations for different components.
-                # log(exp(target)) = target
-                initial_bias = np.log(neutral_target_sigma)
+                # We are switching to softplus(x) + min, so we need the inverse softplus for the bias:
+                # x = log(exp(target) - 1)
+                initial_bias = np.log(np.exp(neutral_target_sigma) - 1)
                 
-                # Set the bias for the log_sigma_head to this value.
                 self.log_sigma_head.bias.fill_(initial_bias)
 
-                # We still want the weights to be small, so the bias dominates at the start.
-                nn.init.normal_(self.log_sigma_head.weight, mean=0.0, std=0.001)
+                # Set weights exactly to zero! During Phase 1 (when frozen), 
+                # this guarantees the output stays rigidly at 0.2 regardless of backbone changes.
+                nn.init.zeros_(self.log_sigma_head.weight)
                 
                 # The correlation head initialization can remain the same.
-                # Starting with zero correlation (an identity matrix) is a good neutral default.
                 nn.init.zeros_(self.lower_head.bias)
                 nn.init.normal_(self.lower_head.weight, mean=0.0, std=0.01)
     
     def forward(self, feats: torch.Tensor):
-        """Forward pass."""
         B = feats.size(0)
         d, K = self.d, self.K
         
-        # Predict standard deviations
-        log_sigma = self.log_sigma_head(feats)
+        # Predict standard deviations (raw logits)
+        raw_sigma = self.log_sigma_head(feats)
         
         if K == 1:
-            sigma_raw = torch.exp(log_sigma)  # [B, d]
+            # Use softplus instead of exp to prevent numerical explosion
+            sigma_raw = F.softplus(raw_sigma)  # [B, d]
         
-            # Apply per-parameter minimum WITHOUT in-place operations
-            # Create a tensor of minimums and use torch.maximum
-            min_vals = torch.tensor(
-                [self.per_param_min_sigma.get(i, self.min_sigma) for i in range(d)],
+            # Create a tensor of minimums
+            min_vals = torch.tensor([self.per_param_min_sigma.get(i, self.min_sigma) for i in range(d)],
                 device=feats.device,
                 dtype=feats.dtype
             ).unsqueeze(0)  # [1, d]
             
-            sigma = torch.maximum(sigma_raw, min_vals)  # [B, d] 
+            # Use ADDITION instead of torch.maximum to guarantee gradients always flow backward
+            sigma = sigma_raw + min_vals  # [B, d] 
         else:
-            sigma_raw = torch.exp(log_sigma.view(B, K, d))  # [B, K, d]
+            sigma_raw = F.softplus(raw_sigma.view(B, K, d))  # [B, K, d]
         
-            # Apply per-parameter minimum WITHOUT in-place operations
-            min_vals = torch.tensor(
-                [self.per_param_min_sigma.get(i, self.min_sigma) for i in range(d)],
+            min_vals = torch.tensor([self.per_param_min_sigma.get(i, self.min_sigma) for i in range(d)],
                 device=feats.device,
                 dtype=feats.dtype
-            ).unsqueeze(0).unsqueeze(0)  # [1, 1, d]
+            ).unsqueeze(0).unsqueeze(0)  #[1, 1, d]
             
-            sigma = torch.maximum(sigma_raw, min_vals)  # [B, K, d] 
+            # Use ADDITION instead of torch.maximum
+            sigma = sigma_raw + min_vals  # [B, K, d] 
+            
+        
         
         # Predict lower-triangular correlation elements
         lower_raw = self.lower_head(feats)
@@ -507,7 +600,7 @@ class Spectral2DResNet(nn.Module):
     def __init__(self,
                  block_2d, spatial_layers_config, block_inplanes_spectral=64,
                  num_wavelengths_in=2000, initial_proj_channels=64, n_outputs=4,
-                 dropout_prob=0.2, use_batchnorm=True, fc_hidden_dim=512,
+                 dropout_prob=0.0, use_batchnorm=True, fc_hidden_dim=512,
                  target_params_list=None,
                  use_attention_heads=False, attention_latent_dim=128, use_mdn = True, covariance_type: str = "diagonal", num_mixtures: int = 1,
                  covariance_mode='cholesky_constrained',
@@ -582,6 +675,11 @@ class Spectral2DResNet(nn.Module):
         final_spatial_channels = spatial_layers_config[-1][0] * block_2d.expansion
         
         # A shared fully connected (FC) block to create a final feature vector.
+        # Print dropout info on rank0 if dropout_prob is nonzero
+        if dropout_prob > 0.0:
+            print_rank0(f"Implementing shared sequential part with dropout layer and dropout probability {dropout_prob}")
+        if dropout_prob == 0.0:
+            print_rank0("Implementing shared sequential part WITHOUT dropout layer")
         self.shared_fc = nn.Sequential(
             nn.Flatten(),
             nn.Linear(final_spatial_channels, fc_hidden_dim),
@@ -608,7 +706,7 @@ class Spectral2DResNet(nn.Module):
 
         # If using full covariance MDN, create the dedicated covariance head.
         if self.use_mdn and self.covariance_type == "full":
-            self.cov_head = CovarianceHead(
+            self.cov_head = CovarianceHead_latest(
                 fc_hidden_dim, 
                 n_outputs, 
                 num_components=self.num_mixtures,
@@ -658,7 +756,11 @@ class Spectral2DResNet(nn.Module):
 
     def _initialize_weights(self):
         """Initializes model weights using standard practices (Kaiming for conv, Xavier for linear)."""
-        for m in self.modules():
+        for name, m in self.named_modules():
+            # SKIP the covariance head so we don't overwrite its custom initial uncertainty bias!
+            if 'cov_head' in name:
+                continue
+                
             if isinstance(m, (nn.Conv2d, nn.Conv3d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm)):
@@ -763,7 +865,7 @@ def generate_2d_model(config_name="resnet18_2d_equivalent", TARGET_PARAMETERS=No
         'block_inplanes_spectral': 64,
         'initial_proj_channels': 64,
         'n_outputs': len(TARGET_PARAMETERS),
-        'dropout_prob': 0.2,
+        'dropout_prob': 0.0,
         'use_batchnorm': False,
         'fc_hidden_dim': 512,
         'target_params_list': TARGET_PARAMETERS,

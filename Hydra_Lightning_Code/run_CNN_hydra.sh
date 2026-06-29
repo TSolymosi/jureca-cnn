@@ -7,15 +7,20 @@ JOB_ID="14077158"
 TRAINING_JOB_ID=""
 RUN_MODE="" # sweep for Optuna multirun, empty for single run
 
+LOAD_OPTION=""   # best, last, or a filename
+
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --job_id) JOB_ID="$2"; shift ;;
         --load_id) TRAINING_JOB_ID="$2"; shift ;;
-        -m|--sweep) RUN_MODE="sweep" ;;   # enable Hydra multirun
+        --load_option) LOAD_OPTION="$2"; shift ;;
+        -m|--sweep) RUN_MODE="sweep" ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+
 
 # ------------------ Parameters ------------------
 CPUS_FOR_PYTHON=8
@@ -25,12 +30,12 @@ SLURM_NNODES=1
 #MODEL_PARAMS="D L ro rr p Tlow NCH3CN plummer_shape"
 #LOG_SCALE_PARAMS="D L NCH3CN"
 FOLDER_NAME="first_test"
-SCALING_PARAMS_PATH="/p/scratch/westai0043/CNN_HL_tobias/Parameters/${JOB_ID}/label_scaling.pt"
+SCALING_PARAMS_PATH="/p/scratch/westai0101/CNN_HL_tobias/Parameters/${JOB_ID}/label_scaling.pt"
 NODE_LOCAL_DIR="/local/nvme/${JOB_ID}_fits_data"
 
 #VENV_PATH="/p/scratch/westai0043/CNN_timon/testing/sc_venv_template/venv/bin/activate"
 VENV_PATH="/p/project1/pasta/jusuf-radmc/.radmc_venv_2024/bin/activate"
-SCRIPT_PATH="/p/scratch/westai0043/CNN_HL_tobias/src/train.py"
+SCRIPT_PATH="/p/scratch/westai0101/CNN_HL_tobias/src/train.py"
 LOG_DIR="slurm_output/cnn_run"
 LOG_FILE="${LOG_DIR}/hydra_run_${JOB_ID}.log"
 
@@ -80,16 +85,18 @@ ARGS=(
   "trainer.accelerator=gpu"
   "trainer.devices=${GPUS_PER_NODE}"
   "trainer.num_nodes=${SLURM_NNODES}"
-  "trainer.max_epochs=90"
+  "trainer.max_epochs=250"
   "+job_id=${JOB_ID}"
   "data.use_cauchy_noise=True"
   "data.mask_13co=True"
-  "model.num_mixtures=3"
+  "model.num_mixtures=7"
   #"data.add_noise_level=0.0"
 )
 
 [[ -n "${FOLDER_NAME}" ]]     && ARGS+=("+folder_name=${FOLDER_NAME}")
 [[ -n "${TRAINING_JOB_ID}" ]] && ARGS+=("+load_id=${TRAINING_JOB_ID}")
+[[ -n "${LOAD_OPTION}" ]] && ARGS+=("+load_option=${LOAD_OPTION}")
+
 
 # ------------------ NCCL setup (single-node friendly) ------------------
 export MASTER_ADDR=127.0.0.1

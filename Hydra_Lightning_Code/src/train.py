@@ -120,7 +120,9 @@ def main(cfg: DictConfig):
         optim_cfg=cfg.optim,
         training_cfg=cfg.trainer,
         strategy_cfg=cfg.training_strategy,
-        std_weights=std_weights
+        std_weights=std_weights,
+        job_id=cfg.get("job_id", None),
+        load_id=cfg.get("load_id", None),
     )
 
     # --- START OF NEW DIAGNOSTIC BLOCK ---
@@ -188,38 +190,60 @@ def main(cfg: DictConfig):
     ckpt_path = cfg.get("ckpt_path", None)
     mode = cfg.get("mode", "train")
     load_id = cfg.get("load_id", None)
+    load_option = cfg.get("load_option", "best")  # default: best
+
+    folder_name = cfg.get("folder_name", "default_folder")
+    ckpt_dir = os.path.join("outputs", folder_name, str(load_id), "checkpoints")
+
 
     
 
     if ckpt_path is None and load_id is not None:
-        folder_name = cfg.get("folder_name", "default_folder")
-        ckpt_dir = os.path.join("outputs", folder_name, str(load_id), "checkpoints")
         
-        best_ckpt = None
-        best_loss = float("inf")
 
-        if os.path.isdir(ckpt_dir):
-            for fname in os.listdir(ckpt_dir):
-                # Match epoch_XXX-val_loss_6.1234.ckpt
-                m = re.match(r"epoch_\d+-val_loss_([-+]?[0-9]*\.?[0-9]+)\.ckpt$", fname)
-                if m:
-                    loss = float(m.group(1))
-                    if loss < best_loss:
-                        best_loss = loss
-                        best_ckpt = os.path.join(ckpt_dir, fname)
-
-        if best_ckpt:
-            ckpt_path = best_ckpt
-            rank_zero_info(f"Selected best checkpoint: {ckpt_path} (val_loss={best_loss})")
-        else:
+        if load_option == "last":
             last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
             if os.path.exists(last_ckpt):
                 ckpt_path = last_ckpt
-                rank_zero_info(f"No best-loss checkpoint found. Using last checkpoint: {ckpt_path}")
+                rank_zero_info(f"Loading last checkpoint: {ckpt_path}")
             else:
-                rank_zero_info(
-                    f"WARNING: load_id '{load_id}' was provided, but no checkpoint found. Starting from scratch."
-                )
+                rank_zero_info(f"last.ckpt not found for load_id={load_id}. Starting from scratch.")
+        
+        elif load_option == "best":
+            best_ckpt = None
+            best_loss = float("inf")
+
+            if os.path.isdir(ckpt_dir):
+                for fname in os.listdir(ckpt_dir):
+                    m = re.match(r"epoch_\d+-val_loss_([-+]?[0-9]*\.?[0-9]+)\.ckpt$", fname)
+                    if m:
+                        loss = float(m.group(1))
+                        if loss < best_loss:
+                            best_loss = loss
+                            best_ckpt = os.path.join(ckpt_dir, fname)
+
+            if best_ckpt:
+                ckpt_path = best_ckpt
+                rank_zero_info(f"Loading best checkpoint: {ckpt_path} (val_loss={best_loss})")
+            else:
+                last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
+                if os.path.exists(last_ckpt):
+                    ckpt_path = last_ckpt
+                    rank_zero_info(f"No best checkpoint found. Using last: {ckpt_path}")
+                else:
+                    rank_zero_info(f"No checkpoint found. Starting from scratch.")
+
+    else:
+        # load_option is interpreted as explicit filename
+        explicit = os.path.join(ckpt_dir, load_option)
+        if os.path.exists(explicit):
+            ckpt_path = explicit
+            rank_zero_info(f"Loading explicit checkpoint: {ckpt_path}")
+        else:
+            rank_zero_info(f"Explicit checkpoint '{explicit}' not found. Starting from scratch.")
+
+    
+
 
     if mode == "train":
         trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
@@ -242,6 +266,7 @@ def main(cfg: DictConfig):
         
         if trainer.is_global_zero:
             if hasattr(model, "_test_cache") and model._test_cache:
+                
                 final_results = model._test_cache
                 dataset_ref = datamodule.get_dataset_reference()
                 
